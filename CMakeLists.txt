@@ -506,6 +506,19 @@ if(UA_ENABLE_ENCRYPTION_OPENSSL)
     # https://cmake.org/cmake/help/v3.13/module/FindOpenSSL.html
     find_package(OpenSSL REQUIRED)
     list(APPEND open62541_LIBRARIES "${OPENSSL_LIBRARIES}")
+    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
+
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+
+    if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
+        message(STATUS "Found liboqs: ${OQS_LIBRARY}")
+        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
+        include_directories(${OQS_INCLUDE_DIR})
+        list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
+        set(OQS_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+    endif()
     if(WIN32)
         # Add bestcrypt for windows systems
         list(APPEND open62541_LIBRARIES bcrypt)
@@ -516,6 +529,19 @@ if(UA_ENABLE_ENCRYPTION_LIBRESSL)
     # See https://github.com/libressl-portable/portable/blob/master/FindLibreSSL.cmake
     find_package(LibreSSL REQUIRED)
     list(APPEND open62541_LIBRARIES ${LIBRESSL_LIBRARIES})
+    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
+
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+
+    if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
+        message(STATUS "Found liboqs: ${OQS_LIBRARY}")
+        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
+        include_directories(${OQS_INCLUDE_DIR})
+        list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
+        set(OQS_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+    endif()
     if(WIN32)
         # Add bestcrypt for random generator and ws2_32 for crypto
         list(APPEND open62541_LIBRARIES ws2_32 bcrypt)
@@ -528,6 +554,19 @@ if(UA_ENABLE_ENCRYPTION_MBEDTLS)
     # defined in /tools/cmake/FindMbedTLS.cmake.
     find_package(MbedTLS REQUIRED)
     list(APPEND open62541_LIBRARIES ${MBEDTLS_LIBRARIES})
+    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
+
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+
+    if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
+        message(STATUS "Found liboqs: ${OQS_LIBRARY}")
+        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
+        include_directories(${OQS_INCLUDE_DIR})
+        list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
+        set(OQS_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+    endif()
     if(WIN32)
         # Add bestcrypt for windows systems
         list(APPEND open62541_LIBRARIES bcrypt)
@@ -992,6 +1031,7 @@ endif()
 set(plugin_headers ${PROJECT_SOURCE_DIR}/plugins/include/open62541/plugin/accesscontrol_default.h
                    ${PROJECT_SOURCE_DIR}/plugins/include/open62541/plugin/certificategroup_default.h
                    ${PROJECT_SOURCE_DIR}/plugins/include/open62541/plugin/log_stdout.h
+                   ${PROJECT_SOURCE_DIR}/plugins/include/open62541/plugin/securitypolicy_pqc.h
                    ${PROJECT_SOURCE_DIR}/plugins/include/open62541/plugin/nodestore_default.h
                    ${PROJECT_SOURCE_DIR}/plugins/include/open62541/server_config_default.h
                    ${PROJECT_SOURCE_DIR}/plugins/include/open62541/client_config_default.h
@@ -1107,6 +1147,7 @@ if(UA_ENABLE_ENCRYPTION_MBEDTLS OR UA_ENABLE_AMALGAMATION)
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/securitypolicy_basic256sha256.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/securitypolicy_aes128sha256rsaoaep.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/securitypolicy_aes256sha256rsapss.c
+         ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_pqc.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/securitypolicy_pubsub_aes128ctr.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/securitypolicy_pubsub_aes256ctr.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/mbedtls/create_certificate.c
@@ -1123,6 +1164,7 @@ if(UA_ENABLE_ENCRYPTION_OPENSSL OR UA_ENABLE_ENCRYPTION_LIBRESSL OR UA_ENABLE_AM
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_basic256sha256.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_aes128sha256rsaoaep.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_aes256sha256rsapss.c
+         ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_pqc.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/securitypolicy_eccnistp256.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/create_certificate.c
          ${PROJECT_SOURCE_DIR}/plugins/crypto/openssl/certificategroup.c)

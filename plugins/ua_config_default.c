@@ -926,6 +926,15 @@ addAllSecurityPolicies(UA_SecurityPolicy *sp, size_t *length,
                        UA_StatusCode_name(retval));
     }
 
+    /* Kyber768+Dilithium2 */
+    retval = UA_SecurityPolicy_PQC(sp + *length, certificate, privateKey, logging);
+    *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_WARNING(logging, UA_LOGCATEGORY_USERLAND,
+                       "Could not add SecurityPolicy#PQC with error code %s",
+                       UA_StatusCode_name(retval));
+    }
+
     /* Aes128Sha256RsaOaep */
     retval = UA_SecurityPolicy_Aes128Sha256RsaOaep(sp + *length, certificate, privateKey, logging);
     *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
