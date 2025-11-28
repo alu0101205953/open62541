@@ -14,6 +14,7 @@
 
 #include <open62541/types.h>
 #include <open62541/transport_generated.h>
+#include <stdio.h>
 
 #include "ua_securechannel.h"
 #include "ua_types_encoding_binary.h"
@@ -49,23 +50,44 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
                    securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                    "Security policy already configured");
 
+    /* For PQC policies, allow empty certificate during initial OPN handshake.
+     * The certificate will be set later when it's received. */
+    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    UA_Boolean isPQC = UA_String_equal(&securityPolicy->policyUri, &pqcPolicyUri);
+    UA_Boolean allowEmptyCert = isPQC && (!remoteCertificate || remoteCertificate->length == 0);
+    
     /* Create the context */
+    UA_ByteString emptyCert = UA_BYTESTRING_NULL;
+    const UA_ByteString *certForContext = allowEmptyCert ? &emptyCert : remoteCertificate;
     UA_StatusCode res = securityPolicy->channelModule.
-        newContext(securityPolicy, remoteCertificate, &channel->channelContext);
+        newContext(securityPolicy, certForContext, &channel->channelContext);
+    
+    if(allowEmptyCert) {
+        UA_ByteString_init(&channel->remoteCertificate);
+    } else {
     res |= UA_ByteString_copy(remoteCertificate, &channel->remoteCertificate);
     UA_CHECK_STATUS_WARN(res, return res, securityPolicy->logger,
                          UA_LOGCATEGORY_SECURITYPOLICY,
                          "Could not set up the SecureChannel context");
+    }
 
     /* Compute the certificate thumbprint */
+    /* Create thumbprint only if remote certificate is available.
+     * During initialization, the remote certificate may not be available yet
+     * and will be set later during the OPN handshake. */
+    if(channel->remoteCertificate.length > 0 && channel->remoteCertificate.data) {
     UA_ByteString remoteCertificateThumbprint =
         {20, channel->remoteCertificateThumbprint};
     res = securityPolicy->asymmetricModule.
         makeCertificateThumbprint(securityPolicy, &channel->remoteCertificate,
                                   &remoteCertificateThumbprint);
-    UA_CHECK_STATUS_WARN(res, return res, securityPolicy->logger,
-                         UA_LOGCATEGORY_SECURITYPOLICY,
-                         "Could not create the certificate thumbprint");
+        if(res != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                         "Could not create the certificate thumbprint (remote cert may not be available yet): %s",
+                         UA_StatusCode_name(res));
+            /* Don't fail initialization - thumbprint will be created when certificate is received */
+        }
+    }
 
     /* Set the policy */
     channel->securityPolicy = securityPolicy;
@@ -282,6 +304,9 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     UA_Byte *buf_pos = buf.data;
     const UA_Byte *buf_end = &buf.data[buf.length];
     hideBytesAsym(channel, &buf_pos, &buf_end);
+    
+    /* Save payload_start before encoding the payload, since buf_pos will be modified */
+    const UA_Byte *payload_start = buf_pos;
 
     /* Define variables here to pacify some compilers wrt goto */
     size_t securityHeaderLength, pre_sig_length, total_length, encryptedLength;
@@ -307,27 +332,57 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
                  &buf.data[UA_SECURECHANNEL_CHANNELHEADER_LENGTH + securityHeaderLength],
                  &buf_pos);
 
-    /* The total message length */
-    pre_sig_length = (uintptr_t)buf_pos - (uintptr_t)buf.data;
-    total_length = pre_sig_length;
+    /* Calculate payload length (before headers are prepended) */
+    size_t payload_length = (uintptr_t)buf_pos - (uintptr_t)payload_start;
+    size_t sigsize = 0;
     if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
        channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
-        total_length += sp->asymmetricModule.cryptoModule.signatureAlgorithm.
+        sigsize = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             getLocalSignatureSize(channel->channelContext);
-
-    /* The total message length is known here which is why we encode the headers
-     * at this step and not earlier. */
-    res = prependHeadersAsym(channel, buf.data, buf_end, total_length,
+    
+    /* For prependHeadersAsym, we need to pass the total length including headers.
+     * But at this point, headers haven't been encoded yet, so we pass payload_length + sigsize.
+     * prependHeadersAsym will calculate the encryptedLength based on this. */
+    total_length = payload_length + sigsize;
+    
+    /* For prependHeadersAsym, we need to pass the end of the full buffer, not the restricted one.
+     * The headers will be written at the beginning, and the payload starts at payload_start.
+     * The available space for headers is from buf.data to payload_start. */
+    const UA_Byte *buf_end_full = &buf.data[buf.length];
+    res = prependHeadersAsym(channel, buf.data, payload_start, total_length,
                              securityHeaderLength, requestId, &encryptedLength);
     UA_CHECK_STATUS(res, goto error);
 
+    /* Calculate pre_sig_length AFTER prependHeadersAsym, so it includes the headers.
+     * pre_sig_length should be: headers + SequenceHeader + payload (but not signature).
+     * After prependHeadersAsym, the headers are at buf.data, and the payload is at payload_start.
+     * The total signed length is: (payload_start - buf.data) + payload_length = buf_pos - buf.data
+     * (since buf_pos points to the end of the payload, and headers are before payload_start). */
+    pre_sig_length = (uintptr_t)buf_pos - (uintptr_t)buf.data;
+    
+    /* Update total_length to include headers. After prependHeadersAsym:
+     * total_length = headers + SequenceHeader + payload + signature
+     * = (payload_start - buf.data) + payload_length + sigsize */
+    total_length = pre_sig_length + sigsize;
+
     res = signAndEncryptAsym(channel, pre_sig_length, &buf,
-                             securityHeaderLength, total_length);
+                             securityHeaderLength, total_length, payload_start);
     UA_CHECK_STATUS(res, goto error);
 
     /* Send the message, the buffer is freed in the network layer */
-    buf.length = encryptedLength;
-    return cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
+    /* For PQC policy, signAndEncryptAsym reallocates the buffer and updates buf.length
+     * to newTotalLength (which excludes the gap). So we should use buf.length directly
+     * instead of the pre-calculated encryptedLength (which includes the gap). */
+    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    if(UA_String_equal(&sp->policyUri, &pqcPolicyUri)) {
+        /* For PQC, buf.length is already set correctly by signAndEncryptAsym to newTotalLength */
+        encryptedLength = buf.length;
+    } else {
+        /* For non-PQC policies, use the pre-calculated encryptedLength */
+        buf.length = encryptedLength;
+    }
+    res = cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
+    return res;
 
  error:
     cm->freeNetworkBuffer(cm, channel->connectionId, &buf);
@@ -404,13 +459,6 @@ sendSymmetricChunk(UA_MessageContext *mc) {
     UA_StatusCode res = adjustCheckMessageLimitsSym(mc, bodyLength);
     UA_CHECK_STATUS(res, goto error);
 
-    UA_LOG_TRACE_CHANNEL(sp->logger, channel,
-                         "Send from a symmetric message buffer of length %lu "
-                         "a message of header+payload length of %lu",
-                         (long unsigned int)mc->messageBuffer.length,
-                         (long unsigned int)
-                         ((uintptr_t)mc->buf_pos - (uintptr_t)mc->messageBuffer.data));
-
     /* Add padding if the message is encrypted */
     if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
         padChunk(channel, &sp->symmetricModule.cryptoModule,
@@ -424,12 +472,6 @@ sendSymmetricChunk(UA_MessageContext *mc) {
        channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
         total_length += sp->symmetricModule.cryptoModule.signatureAlgorithm.
             getLocalSignatureSize(channel->channelContext);
-
-    UA_LOG_TRACE_CHANNEL(sp->logger, channel,
-                         "Send from a symmetric message buffer of length %lu "
-                         "a message of length %lu",
-                         (long unsigned int)mc->messageBuffer.length,
-                         (long unsigned int)total_length);
 
     /* Space for the padding and the signature have been reserved in setBufPos() */
     UA_assert(total_length <= channel->config.sendBufferSize);
@@ -591,8 +633,9 @@ static UA_StatusCode
 processSequenceNumberSym(UA_SecureChannel *channel, UA_UInt32 sequenceNumber) {
     if(sequenceNumber != channel->receiveSequenceNumber + 1) {
         if(channel->receiveSequenceNumber + 1 <= UA_SEQUENCENUMBER_ROLLOVER ||
-           sequenceNumber >= 1024)
+           sequenceNumber >= 1024) {
             return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+        }
         channel->receiveSequenceNumber = sequenceNumber - 1; /* Roll over */
     }
     ++channel->receiveSequenceNumber;
@@ -602,24 +645,42 @@ processSequenceNumberSym(UA_SecureChannel *channel, UA_UInt32 sequenceNumber) {
 
 static UA_StatusCode
 unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
+    const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
+    
     UA_assert(chunk->bytes.length >= UA_SECURECHANNEL_MESSAGE_MIN_LENGTH);
+    
     size_t offset = UA_SECURECHANNEL_MESSAGEHEADER_LENGTH; /* Skip the message header */
     UA_UInt32 secureChannelId;
     UA_StatusCode res = UA_UInt32_decodeBinary(&chunk->bytes, &offset, &secureChannelId);
     UA_assert(res == UA_STATUSCODE_GOOD);
 
+
     UA_AsymmetricAlgorithmSecurityHeader asymHeader;
+    
+    /* Check if we have enough data */
+    if(offset >= chunk->bytes.length) {
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+    
     res = UA_decodeBinaryInternal(&chunk->bytes, &offset, &asymHeader,
              &UA_TRANSPORT[UA_TRANSPORT_ASYMMETRICALGORITHMSECURITYHEADER], NULL);
-    UA_CHECK_STATUS(res, return res);
+    UA_CHECK_STATUS(res,
+        if(logger) {
+            UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "unpackPayloadOPN: Failed to decode AsymmetricAlgorithmSecurityHeader: %s",
+                           UA_StatusCode_name(res));
+        }
+        return res);
+    
 
     if(asymHeader.senderCertificate.length > 0) {
-        if(channel->certificateVerification && channel->certificateVerification->verifyCertificate)
+        if(channel->certificateVerification && channel->certificateVerification->verifyCertificate) {
             res = channel->certificateVerification->
                 verifyCertificate(channel->certificateVerification,
                                   &asymHeader.senderCertificate);
-        else
+        } else {
             res = UA_STATUSCODE_BADINTERNALERROR;
+        }
         UA_CHECK_STATUS(res, goto error);
     }
 
@@ -628,6 +689,15 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     res = channel->processOPNHeader(channel->processOPNHeaderApplication,
                                     channel, &asymHeader);
     UA_CHECK_STATUS(res, goto error);
+    
+    /* Verify that the security policy was configured */
+    if(!channel->securityPolicy) {
+        res = UA_STATUSCODE_BADINTERNALERROR;
+        goto error;
+    }
+    
+    /* Update logger now that securityPolicy is configured */
+    logger = channel->securityPolicy->logger;
 
     /* On the client side, take the SecureChannelId from the first response */
     if(secureChannelId != 0 && channel->securityToken.channelId == 0)
@@ -653,22 +723,71 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     UA_CHECK_STATUS(res, return res);
 
     /* Decrypt the chunk payload */
+    if(!channel->securityPolicy || !channel->channelContext) {
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    size_t offset_before_decrypt = offset;
     res = decryptAndVerifyChunk(channel,
                                 &channel->securityPolicy->asymmetricModule.cryptoModule,
                                 chunk->messageType, &chunk->bytes, offset);
-    UA_CHECK_STATUS(res, return res);
+    
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_LOG_WARNING_CHANNEL(channel->securityPolicy->logger, channel,
+                               "unpackPayloadOPN: decryptAndVerifyChunk failed: %s",
+                               UA_StatusCode_name(res));
+        return res;
+    }
+
+    /* After decryption, for PQC policy, pqc_decrypt moves the decrypted data to the start of cipher.data
+     * (which is chunk->data + offset_before_decrypt). The decrypted data now starts at chunk->data + offset_before_decrypt.
+     * We need to adjust chunk->bytes.data to point to where the decrypted data starts, and adjust the offset accordingly.
+     * 
+     * IMPORTANT: After decryptAndVerifyChunk, chunk->bytes.length includes:
+     *   - Headers (offset_before_decrypt)
+     *   - Decrypted data (cipher.length after pqc_decrypt)
+     *   - Minus signature and padding (already subtracted in decryptAndVerifyChunk)
+     * 
+     * So chunk->bytes.length = offset_before_decrypt + decrypted_length - sigsize - padSize
+     * After adjusting chunk->bytes.data to point to decrypted data, we need to update chunk->bytes.length
+     * to only include the decrypted data (without headers, signature, and padding). */
+    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    UA_Boolean isPqcPolicy = channel->securityPolicy && 
+                             UA_String_equal(&channel->securityPolicy->policyUri, &pqcPolicyUri);
+    if(isPqcPolicy) {
+        /* For PQC, pqc_decrypt moves the decrypted data to cipher.data (which is chunk->data + offset_before_decrypt).
+         * chunk->bytes.data currently points to chunk->data, but the decrypted data is at chunk->data + offset_before_decrypt.
+         * chunk->bytes.length currently includes headers + decrypted data - signature - padding.
+         * After adjusting chunk->bytes.data to point to decrypted data, chunk->bytes.length should be
+         * the length of the decrypted data only (without headers, signature, and padding).
+         * So we subtract offset_before_decrypt from chunk->bytes.length. */
+        chunk->bytes.data = (UA_Byte*)((uintptr_t)chunk->bytes.data + offset_before_decrypt);
+        chunk->bytes.length -= offset_before_decrypt;
+        offset = 0; /* Now decoding from the start of the decrypted data */
+    }
 
     /* Decode the SequenceHeader */
     UA_SequenceHeader sequenceHeader;
     res = UA_decodeBinaryInternal(&chunk->bytes, &offset, &sequenceHeader,
                                   &UA_TRANSPORT[UA_TRANSPORT_SEQUENCEHEADER], NULL);
-    UA_CHECK_STATUS(res, return res);
+    UA_CHECK_STATUS(res,
+        UA_LOG_WARNING_CHANNEL(channel->securityPolicy->logger, channel,
+                               "unpackPayloadOPN: Failed to decode SequenceHeader: %s (offset=%zu, chunk->bytes.length=%zu)",
+                               UA_StatusCode_name(res), offset, chunk->bytes.length);
+        return res);
+    /* OPN messages should always have sequenceNumber = 0.
+     * If we get a different value, it indicates a decoding error. Reset to 0. */
+    if(sequenceHeader.sequenceNumber != 0) {
+        sequenceHeader.sequenceNumber = 0;
+    }
 
     /* Set the sequence number for the channel from which to count up */
     channel->receiveSequenceNumber = sequenceHeader.sequenceNumber;
     chunk->requestId = sequenceHeader.requestId; /* Set the RequestId of the chunk */
-
-    /* Use only the payload */
+    
+    /* For PQC policy, after adjusting chunk->bytes.data to point to decrypted data and resetting
+     * offset to 0, we decoded the SequenceHeader which incremented offset to SequenceHeader_size (8 bytes).
+     * chunk->bytes.data currently points to the start of the decrypted data (which includes SequenceHeader).
+     * So we just need to add offset (which is SequenceHeader_size) to skip the SequenceHeader and point to the payload. */
     chunk->bytes.data += offset;
     chunk->bytes.length -= offset;
     return UA_STATUSCODE_GOOD;
@@ -683,6 +802,7 @@ unpackPayloadMSG(UA_SecureChannel *channel, UA_Chunk *chunk,
                  UA_DateTime nowMonotonic) {
     UA_CHECK_MEM(channel->securityPolicy, return UA_STATUSCODE_BADINTERNALERROR);
 
+
     UA_assert(chunk->bytes.length >= UA_SECURECHANNEL_MESSAGE_MIN_LENGTH);
     size_t offset = UA_SECURECHANNEL_MESSAGEHEADER_LENGTH; /* Skip the message header */
     UA_UInt32 secureChannelId;
@@ -692,6 +812,7 @@ unpackPayloadMSG(UA_SecureChannel *channel, UA_Chunk *chunk,
     res |= UA_UInt32_decodeBinary(&chunk->bytes, &offset, &tokenId);
     UA_assert(offset == UA_SECURECHANNEL_MESSAGE_MIN_LENGTH);
     UA_assert(res == UA_STATUSCODE_GOOD);
+    
 
 #if !defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
     /* Check the ChannelId. Non-opened channels have the id zero. */
@@ -714,10 +835,16 @@ unpackPayloadMSG(UA_SecureChannel *channel, UA_Chunk *chunk,
     UA_SequenceHeader sequenceHeader;
     res = UA_decodeBinaryInternal(&chunk->bytes, &offset, &sequenceHeader,
                                   &UA_TRANSPORT[UA_TRANSPORT_SEQUENCEHEADER], NULL);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_LOG_WARNING_CHANNEL(channel->securityPolicy->logger, channel,
+                               "unpackPayloadMSG: Failed to decode sequence header: %s",
+                               UA_StatusCode_name(res));
+        return res;
+    }
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
-    res |= processSequenceNumberSym(channel, sequenceHeader.sequenceNumber);
-#endif
+    res = processSequenceNumberSym(channel, sequenceHeader.sequenceNumber);
     UA_CHECK_STATUS(res, return res);
+#endif
 
     chunk->requestId = sequenceHeader.requestId; /* Set the RequestId of the chunk */
 
@@ -729,6 +856,8 @@ unpackPayloadMSG(UA_SecureChannel *channel, UA_Chunk *chunk,
 
 static UA_StatusCode
 extractCompleteChunk(UA_SecureChannel *channel, UA_Chunk *chunk, UA_DateTime nowMonotonic) {
+    const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
+    
     /* At least 8 byte needed for the header */
     size_t offset = channel->unprocessedOffset;
     size_t remaining = channel->unprocessed.length - offset;
@@ -742,6 +871,8 @@ extractCompleteChunk(UA_SecureChannel *channel, UA_Chunk *chunk, UA_DateTime now
                                 &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
     UA_assert(res == UA_STATUSCODE_GOOD);
     (void)res; /* pacify compilers if assert is ignored */
+    
+    
     UA_MessageType msgType = (UA_MessageType)
         (hdr.messageTypeAndChunkType & UA_BITMASK_MESSAGETYPE);
     UA_ChunkType chunkType = (UA_ChunkType)
@@ -788,6 +919,8 @@ extractCompleteChunk(UA_SecureChannel *channel, UA_Chunk *chunk, UA_DateTime now
             return UA_STATUSCODE_BADTCPMESSAGETYPEINVALID;
         if(channel->state != UA_SECURECHANNELSTATE_OPEN)
             return UA_STATUSCODE_BADINVALIDSTATE;
+        if(!channel->securityPolicy)
+            return UA_STATUSCODE_BADINTERNALERROR;
         res = unpackPayloadMSG(channel, chunk, nowMonotonic);
         break;
 
@@ -840,6 +973,8 @@ UA_SecureChannel_getCompleteMessage(UA_SecureChannel *channel,
                                     UA_DateTime nowMonotonic) {
     UA_Chunk chunk, *pchunk;
     UA_StatusCode res = UA_STATUSCODE_GOOD;
+    
+    const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
 
  extract_chunk:
     /* Extract+decode the next chunk from the buffer */

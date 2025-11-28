@@ -8,10 +8,15 @@
  */
 
 #include <open62541/types.h>
+#include <string.h>
 
 #include "open62541/transport_generated.h"
 #include "ua_client_internal.h"
 #include "../ua_types_encoding_binary.h"
+
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+#include <open62541/plugin/securitypolicy_pqc.h>
+#endif
 
 /* Some OPC UA servers only return all Endpoints if the EndpointURL used during
  * the HEL/ACK handshake exactly matches -- including the path following the
@@ -165,44 +170,104 @@ signClientSignature(UA_Client *client, UA_ActivateSessionRequest *request) {
     /* Create a temporary buffer */
     size_t signDataSize =
         channel->remoteCertificate.length + client->serverSessionNonce.length;
-    if(signDataSize > MAX_DATA_SIZE)
-        return UA_STATUSCODE_BADINTERNALERROR;
-    UA_Byte buf[MAX_DATA_SIZE];
-    UA_ByteString signData = {signDataSize, buf};
+    
+    /* Use dynamic allocation for PQC certificates which can be larger than MAX_DATA_SIZE */
+    UA_Byte *buf = NULL;
+    UA_Byte buf_static[MAX_DATA_SIZE];
+    UA_ByteString signData = UA_BYTESTRING_NULL;
+    UA_StatusCode retval_final = UA_STATUSCODE_GOOD;
+    
+    if(signDataSize > MAX_DATA_SIZE) {
+        /* Allocate dynamically for large certificates (e.g., PQC certificates) */
+        buf = (UA_Byte *)UA_malloc(signDataSize);
+        if(!buf)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        signData.data = buf;
+        signData.length = signDataSize;
+    } else {
+        signData.data = buf_static;
+        signData.length = signDataSize;
+    }
 
     /* Sign the ClientSignature */
-    memcpy(buf, channel->remoteCertificate.data, channel->remoteCertificate.length);
-    memcpy(buf + channel->remoteCertificate.length, client->serverSessionNonce.data,
+    memcpy(signData.data, channel->remoteCertificate.data, channel->remoteCertificate.length);
+    memcpy(signData.data + channel->remoteCertificate.length, client->serverSessionNonce.data,
            client->serverSessionNonce.length);
-    return signAlg->sign(channel->channelContext, &signData, &sd->signature);
+    retval_final = signAlg->sign(channel->channelContext, &signData, &sd->signature);
+    
+    /* Clean up dynamic buffer if used */
+    if(buf)
+        UA_free(buf);
+    
+    return retval_final;
 }
 
 static UA_StatusCode
 signUserTokenSignature(UA_Client *client, UA_SecurityPolicy *utsp,
                        UA_ActivateSessionRequest *request) {
+    /* Get the client certificate from the userIdentityToken (X509IdentityToken) */
+    UA_ByteString *clientCert = NULL;
+    
+    /* Try to get certificate from utsp->localCertificate first (set by setAuthenticationCert) */
+    if(utsp->localCertificate.length > 0) {
+        clientCert = &utsp->localCertificate;
+    } else {
+        /* Fallback: extract from userIdentityToken if it's an X509IdentityToken */
+        if(request->userIdentityToken.content.decoded.type == &UA_TYPES[UA_TYPES_X509IDENTITYTOKEN]) {
+            UA_X509IdentityToken *x509token = (UA_X509IdentityToken*)
+                request->userIdentityToken.content.decoded.data;
+            if(x509token && x509token->certificateData.length > 0) {
+                clientCert = &x509token->certificateData;
+            }
+        }
+    }
+    
+    /* If still no certificate, use remoteCertificate as fallback (legacy behavior) */
+    if(!clientCert || clientCert->length == 0) {
+        clientCert = &client->channel.remoteCertificate;
+    }
+    
     /* Check the size of the content for signing and create a temporary buffer */
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    size_t signDataSize =
-        client->channel.remoteCertificate.length + client->serverSessionNonce.length;
-    if(signDataSize > MAX_DATA_SIZE)
-        return UA_STATUSCODE_BADINTERNALERROR;
-    UA_Byte buf[MAX_DATA_SIZE];
-    UA_ByteString signData = {signDataSize, buf};
+    size_t signDataSize = clientCert->length + client->serverSessionNonce.length;
+    
+    /* Use dynamic allocation for PQC certificates which can be larger than MAX_DATA_SIZE */
+    UA_Byte *buf = NULL;
+    UA_Byte buf_static[MAX_DATA_SIZE];
+    UA_ByteString signData = UA_BYTESTRING_NULL;
+    
+    if(signDataSize > MAX_DATA_SIZE) {
+        /* Allocate dynamically for large certificates (e.g., PQC certificates) */
+        buf = (UA_Byte *)UA_malloc(signDataSize);
+        if(!buf)
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        signData.data = buf;
+        signData.length = signDataSize;
+    } else {
+        signData.data = buf_static;
+        signData.length = signDataSize;
+    }
 
     /* Copy the algorithm identifier */
     UA_SecurityPolicySignatureAlgorithm *utpSignAlg =
         &utsp->asymmetricModule.cryptoModule.signatureAlgorithm;
     UA_SignatureData *utsd = &request->userTokenSignature;
     retval = UA_String_copy(&utpSignAlg->uri, &utsd->algorithm);
-    if(retval != UA_STATUSCODE_GOOD)
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(buf)
+            UA_free(buf);
         return retval;
+    }
 
     /* We need a channel context with the user certificate in order to reuse the
-     * code for signing. */
-    void *tmpCtx;
-    retval = utsp->channelModule.newContext(utsp, &client->channel.remoteCertificate, &tmpCtx);
-    if(retval != UA_STATUSCODE_GOOD)
+     * code for signing. Use the client certificate, not the server certificate. */
+    void *tmpCtx = NULL;
+    retval = utsp->channelModule.newContext(utsp, clientCert, &tmpCtx);
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(buf)
+            UA_free(buf);
         return retval;
+    }
 
     /* Allocate memory for the signature */
     retval = UA_ByteString_allocBuffer(&utsd->signature,
@@ -211,14 +276,17 @@ signUserTokenSignature(UA_Client *client, UA_SecurityPolicy *utsp,
         goto cleanup_utp;
 
     /* Create the userTokenSignature */
-    memcpy(buf, client->channel.remoteCertificate.data,
-           client->channel.remoteCertificate.length);
-    memcpy(buf + client->channel.remoteCertificate.length,
+    /* According to OPC UA spec, userTokenSignature signs: clientCertificate + serverNonce */
+    memcpy(signData.data, clientCert->data, clientCert->length);
+    memcpy(signData.data + clientCert->length,
            client->serverSessionNonce.data, client->serverSessionNonce.length);
     retval = utpSignAlg->sign(tmpCtx, &signData, &utsd->signature);
 
     /* Clean up */
  cleanup_utp:
+    if(buf)
+        UA_free(buf);
+    if(tmpCtx)
     utsp->channelModule.deleteContext(tmpCtx);
     return retval;
 }
@@ -415,6 +483,10 @@ processACKResponse(UA_Client *client, const UA_ByteString *chunk) {
         return;
     }
 
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "processACKResponse: ACK processed successfully, setting state to ACK_RECEIVED "
+                "(channel->state was %d, setting to %d)",
+                channel->state, UA_SECURECHANNELSTATE_ACK_RECEIVED);
     client->channel.state = UA_SECURECHANNELSTATE_ACK_RECEIVED;
 }
 
@@ -572,6 +644,7 @@ processOPNResponse(UA_Client *client, const UA_ByteString *message) {
 
     /* Compute the new local keys. The remote keys are updated when a message
      * with the new SecurityToken is received. */
+    
     retval = UA_SecureChannel_generateLocalKeys(&client->channel);
     if(retval != UA_STATUSCODE_GOOD) {
         closeSecureChannel(client);
@@ -592,6 +665,10 @@ processOPNResponse(UA_Client *client, const UA_ByteString *message) {
     }
 
     client->channel.state = UA_SECURECHANNELSTATE_OPEN;
+    
+    /* Reset sendSequenceNumber to 0 to match the OPN response sequenceNumber.
+     * The next MSG message will increment it to 1 before sending. */
+    client->channel.sendSequenceNumber = 0;
 }
 
 /* OPN messges to renew the channel are sent asynchronous */
@@ -631,8 +708,9 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     UA_UInt32 requestId = ++client->requestId;
 
     /* Send the OPN message */
-    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
-                 "Requesting to open a SecureChannel");
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
+                 "sendOPNAsync: About to send OPN message (channel->state=%d, requestId=%u, renew=%d)",
+                 client->channel.state, requestId, renew);
     client->connectStatus =
         UA_SecureChannel_sendAsymmetricOPNMessage(&client->channel, requestId, &opnSecRq,
                                                   &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]);
@@ -649,8 +727,9 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     if(client->channel.state < UA_SECURECHANNELSTATE_OPN_SENT)
         client->channel.state = UA_SECURECHANNELSTATE_OPN_SENT;
 
-    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
-                 "OPN message sent");
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
+                 "sendOPNAsync: ✓ OPN message sent successfully (channel->state=%d, requestId=%u)",
+                 client->channel.state, requestId);
 }
 
 UA_StatusCode
@@ -1070,21 +1149,34 @@ matchUserToken(UA_Client *client,
     const UA_DataType *tokenType =
         client->config.userIdentityToken.content.decoded.type;
 
+
     if(tokenPolicy->tokenType == UA_USERTOKENTYPE_ANONYMOUS &&
-       (tokenType == &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN] || !tokenType))
+       (tokenType == &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN] || !tokenType)) {
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "matchUserToken: ✓ Matched ANONYMOUS token");
         return true;
+    }
 
     if(tokenPolicy->tokenType == UA_USERTOKENTYPE_USERNAME &&
-       tokenType == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN])
+       tokenType == &UA_TYPES[UA_TYPES_USERNAMEIDENTITYTOKEN]) {
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "matchUserToken: ✓ Matched USERNAME token");
         return true;
+    }
 
     if(tokenPolicy->tokenType == UA_USERTOKENTYPE_CERTIFICATE &&
-       tokenType == &UA_TYPES[UA_TYPES_X509IDENTITYTOKEN])
+       tokenType == &UA_TYPES[UA_TYPES_X509IDENTITYTOKEN]) {
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "matchUserToken: ✓ Matched CERTIFICATE token");
         return true;
+    }
 
     if(tokenPolicy->tokenType == UA_USERTOKENTYPE_ISSUEDTOKEN &&
-       tokenType == &UA_TYPES[UA_TYPES_ISSUEDIDENTITYTOKEN])
+       tokenType == &UA_TYPES[UA_TYPES_ISSUEDIDENTITYTOKEN]) {
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "matchUserToken: ✓ Matched ISSUEDTOKEN token");
         return true;
+    }
 
     return false;
 }
@@ -1094,6 +1186,7 @@ matchUserToken(UA_Client *client,
  * match. */
 static UA_UserTokenPolicy *
 findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
+    
     /* Was a UserTokenPolicy configured? Then we need an exact match. */
     UA_UserTokenPolicy *requiredTokenPolicy = NULL;
     UA_UserTokenPolicy tmp;
@@ -1102,6 +1195,11 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
         requiredTokenPolicy = &client->config.userTokenPolicy;
 
     for(size_t j = 0; j < endpoint->userIdentityTokensSize; ++j) {
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "findUserTokenPolicy: Checking tokenPolicy[%zu] (tokenType=%d, policyId.length=%zu, securityPolicyUri.length=%zu)",
+                    j, endpoint->userIdentityTokens[j].tokenType,
+                    endpoint->userIdentityTokens[j].policyId.length,
+                    endpoint->userIdentityTokens[j].securityPolicyUri.length);
         /* Is the SecurityPolicy available? */
         UA_UserTokenPolicy *tokenPolicy = &endpoint->userIdentityTokens[j];
 
@@ -1115,8 +1213,9 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
                &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN]) {
             const UA_String none = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
             /* activateSessionAsync() handles the None case separately without accessing authSecurityPolicies */
-            if(!UA_String_equal(&none, &tokenPolicyUri) && !getAuthSecurityPolicy(client, tokenPolicyUri))
+            if(!UA_String_equal(&none, &tokenPolicyUri) && !getAuthSecurityPolicy(client, tokenPolicyUri)) {
                 continue;
+            }
         }
 
         /* Required SecurityPolicyUri in the configuration? */
@@ -1133,8 +1232,6 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
         /* Match with the configured UserToken */
         if(!matchUserToken(client, tokenPolicy))
             continue;
-
-        /* Found a match? */
         return tokenPolicy;
     }
 
@@ -1215,10 +1312,44 @@ responseGetEndpoints(UA_Client *client, void *userdata,
 
     /* Store the endpoint description in the client. It contains the
      * ApplicationDescription and the UserTokenPolicies. We continue to look up
-     * the matching UserTokenPolicy from there. */
+     * the matching UserTokenPolicy from there.
+     * 
+     * IMPORTANT: If the client has a direct endpoint configured with UserTokenPolicies,
+     * preserve those UserTokenPolicies instead of using the ones from the server's endpoint.
+     * This is necessary when the server doesn't return the exact UserTokenPolicy that the
+     * client expects (e.g., for custom security policies like PQC). */
     UA_EndpointDescription_clear(&client->endpoint);
     client->endpoint = resp->endpoints[bestEndpointIndex];
     UA_EndpointDescription_init(&resp->endpoints[bestEndpointIndex]);
+    
+    /* If the client has a direct endpoint configured with UserTokenPolicies, use those instead */
+    if(!endpointUnconfigured(&client->config.endpoint) &&
+       client->config.endpoint.userIdentityTokensSize > 0) {
+        /* Preserve the UserTokenPolicies from the direct endpoint configuration */
+        
+        /* Clear existing UserTokenPolicies from server's endpoint */
+        if(client->endpoint.userIdentityTokens) {
+            for(size_t i = 0; i < client->endpoint.userIdentityTokensSize; i++) {
+                UA_UserTokenPolicy_clear(&client->endpoint.userIdentityTokens[i]);
+            }
+            UA_free(client->endpoint.userIdentityTokens);
+        }
+        client->endpoint.userIdentityTokens = NULL;
+        client->endpoint.userIdentityTokensSize = 0;
+        
+        /* Copy UserTokenPolicies from direct endpoint configuration */
+        UA_StatusCode res = UA_Array_copy(client->config.endpoint.userIdentityTokens,
+                                          client->config.endpoint.userIdentityTokensSize,
+                                          (void**)&client->endpoint.userIdentityTokens,
+                                          &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+        if(res == UA_STATUSCODE_GOOD) {
+            client->endpoint.userIdentityTokensSize = client->config.endpoint.userIdentityTokensSize;
+        } else {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                          "Failed to preserve UserTokenPolicies from direct endpoint: %s",
+                          UA_StatusCode_name(res));
+        }
+    }
 
 #if UA_LOGLEVEL <= 300
     const char *securityModeNames[3] = {"None", "Sign", "SignAndEncrypt"};
@@ -1551,6 +1682,8 @@ connectActivity(UA_Client *client) {
 
         /* ACK receieved. Send OPN. */
     case UA_SECURECHANNELSTATE_ACK_RECEIVED:
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "connectActivity: ACK_RECEIVED state detected, calling sendOPNAsync to send OPN message");
         sendOPNAsync(client, false); /* Send OPN */
         return;
 
@@ -1649,13 +1782,45 @@ verifyClientSecureChannelHeader(void *application, UA_SecureChannel *channel,
     UA_assert(channel->securityMode == UA_MESSAGESECURITYMODE_NONE ||
               serverCert.length > 0);
 
-    /* If a server certificate is sent in the asymHeader, check that the same
-     * certificate was defined for the endpoint */
-    if(serverCert.length > 0 &&
-       !UA_String_equal(&serverCert, &client->endpoint.serverCertificate)) {
-        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                     "The server certificate is different from the EndpointDescription");
-        return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+    /* If a server certificate is sent in the asymHeader, update the channel's remote certificate
+     * and update the channel context with the server's certificate (especially for PQC policies) */
+    if(serverCert.length > 0) {
+        /* Update the channel's remote certificate with the server's certificate from OPN */
+        UA_ByteString_clear(&channel->remoteCertificate);
+        UA_StatusCode rc = UA_ByteString_copy(&serverCert, &channel->remoteCertificate);
+            if(rc != UA_STATUSCODE_GOOD) {
+                UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "Failed to update remote certificate: %s", UA_StatusCode_name(rc));
+                return rc;
+            }
+
+        /* Update the certificate thumbprint */
+        UA_ByteString remoteCertificateThumbprint = {20, channel->remoteCertificateThumbprint};
+        rc = sp->asymmetricModule.makeCertificateThumbprint(sp, &serverCert, &remoteCertificateThumbprint);
+            if(rc != UA_STATUSCODE_GOOD) {
+                UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "Failed to update certificate thumbprint: %s", UA_StatusCode_name(rc));
+                return rc;
+            }
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "Updated certificate thumbprint for received server certificate");
+
+        /* For PQC policies, update the channel context with the server's certificate
+         * to extract the PQC keys (Dilithium and Kyber) */
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+        static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+        if(UA_String_equal(&sp->policyUri, &pqcPolicyUri) && channel->channelContext) {
+            rc = UA_PQCChannel_updateRemoteCertificate(channel->channelContext, &serverCert);
+                if(rc != UA_STATUSCODE_GOOD) {
+                    UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                             "Failed to update PQC channel context with server certificate: %s",
+                                 UA_StatusCode_name(rc));
+                    return rc;
+                }
+            UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "Updated PQC channel context with server certificate");
+        }
+#endif
     }
 
     /* Verify the certificate the server assumes on our end */

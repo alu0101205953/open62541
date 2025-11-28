@@ -38,7 +38,12 @@ void UA_Session_clear(UA_Session *session, UA_Server* server) {
 #endif
 
 #ifdef UA_ENABLE_DIAGNOSTICS
-    deleteNode(server, session->sessionId, true);
+    /* Only delete the diagnostics node if nodestore is still available.
+     * During server shutdown or initialization cleanup, the nodestore may
+     * already be cleaned up or not yet initialized. */
+    if(server->config.nodestore && server->config.nodestore->getNode) {
+        deleteNode(server, session->sessionId, true);
+    }
 #endif
 
     UA_Session_detachFromSecureChannel(server, session);

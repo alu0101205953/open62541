@@ -286,15 +286,19 @@ UA_Subscription_delete(UA_Server *server, UA_Subscription *sub) {
     Subscription_setState(server, sub, UA_SUBSCRIPTIONSTATE_REMOVING);
 
     /* Remove delayed callbacks for processing remaining notifications */
-    if(sub->delayedCallbackRegistered) {
+    if(sub->delayedCallbackRegistered && el && el->removeDelayedCallback) {
         el->removeDelayedCallback(el, &sub->delayedMoreNotifications);
         sub->delayedCallbackRegistered = false;
     }
 
     /* Remove the diagnostics object for the subscription */
 #ifdef UA_ENABLE_DIAGNOSTICS
-    if(!UA_NodeId_isNull(&sub->ns0Id))
+    /* Only delete the diagnostics node if nodestore is still available.
+     * During server shutdown, the nodestore may already be cleaned up. */
+    if(!UA_NodeId_isNull(&sub->ns0Id) && server->config.nodestore &&
+       server->config.nodestore->getNode) {
         deleteNode(server, sub->ns0Id, true);
+    }
     UA_NodeId_clear(&sub->ns0Id);
 #endif
 
@@ -334,11 +338,17 @@ UA_Subscription_delete(UA_Server *server, UA_Subscription *sub) {
 
     /* Pointers to the subscription may still exist upwards in the call stack.
      * Add a delayed callback to remove the Subscription when the current jobs
-     * have completed. */
-    sub->delayedFreePointers.callback = delayedFreeSubscription;
-    sub->delayedFreePointers.application = NULL;
-    sub->delayedFreePointers.context = sub;
-    el->addDelayedCallback(el, &sub->delayedFreePointers);
+     * have completed. However, if the eventLoop is NULL (e.g., during server
+     * shutdown), free the subscription directly. */
+    if(el && el->addDelayedCallback) {
+        sub->delayedFreePointers.callback = delayedFreeSubscription;
+        sub->delayedFreePointers.application = NULL;
+        sub->delayedFreePointers.context = sub;
+        el->addDelayedCallback(el, &sub->delayedFreePointers);
+    } else {
+        /* EventLoop not available (e.g., during server shutdown), free directly */
+        UA_free(sub);
+    }
 }
 
 void

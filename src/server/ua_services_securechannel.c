@@ -92,6 +92,15 @@ Service_OpenSecureChannel(UA_Server *server, UA_SecureChannel *channel,
     UA_EventLoop *el = server->config.eventLoop;
     const UA_SecurityPolicy *sp = channel->securityPolicy;
 
+    if(!sp) {
+        UA_LOG_ERROR_CHANNEL(server->config.logging, channel,
+                             "Service_OpenSecureChannel: channel->securityPolicy is NULL! "
+                             "This should not happen - the security policy should be configured "
+                             "during unpackPayloadOPN via configServerSecureChannel.");
+        response->responseHeader.serviceResult = UA_STATUSCODE_BADINTERNALERROR;
+        return;
+    }
+
     switch(request->requestType) {
     /* Open the channel */
     case UA_SECURITYTOKENREQUESTTYPE_ISSUE:

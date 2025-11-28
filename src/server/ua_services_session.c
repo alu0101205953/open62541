@@ -519,7 +519,8 @@ static UA_StatusCode
 checkCertificateSignature(const UA_Server *server, const UA_SecurityPolicy *securityPolicy,
                           void *channelContext, const UA_ByteString *serverNonce,
                           const UA_SignatureData *signature,
-                          const bool isUserTokenSignature) {
+                          const bool isUserTokenSignature,
+                          const UA_ByteString *certificateToUse) {
     /* Check for zero signature length */
     if(signature->signature.length == 0) {
         if(isUserTokenSignature)
@@ -530,17 +531,32 @@ checkCertificateSignature(const UA_Server *server, const UA_SecurityPolicy *secu
     if(!securityPolicy)
         return UA_STATUSCODE_BADINTERNALERROR;
 
-    /* Server certificate */
-    const UA_ByteString *localCertificate = &securityPolicy->localCertificate;
-    /* Data to verify is calculated by appending the serverNonce to the local certificate */
+    /* For userTokenSignature, use the client certificate from userIdentityToken.
+     * For clientSignature, use the server certificate. */
+    const UA_ByteString *certificate = NULL;
+    if(isUserTokenSignature && certificateToUse && certificateToUse->length > 0) {
+        /* Use the client certificate for userTokenSignature verification */
+        certificate = certificateToUse;
+    } else {
+        /* Use the server certificate for clientSignature verification */
+        certificate = &securityPolicy->localCertificate;
+    }
+    
+    if(!certificate || certificate->length == 0) {
+        if(isUserTokenSignature)
+            return UA_STATUSCODE_BADUSERSIGNATUREINVALID;
+        return UA_STATUSCODE_BADAPPLICATIONSIGNATUREINVALID;
+    }
+    
+    /* Data to verify is calculated by appending the serverNonce to the certificate */
     UA_ByteString dataToVerify;
-    size_t dataToVerifySize = localCertificate->length + serverNonce->length;
+    size_t dataToVerifySize = certificate->length + serverNonce->length;
     UA_StatusCode retval = UA_ByteString_allocBuffer(&dataToVerify, dataToVerifySize);
     if(retval != UA_STATUSCODE_GOOD)
         return retval;
 
-    memcpy(dataToVerify.data, localCertificate->data, localCertificate->length);
-    memcpy(dataToVerify.data + localCertificate->length,
+    memcpy(dataToVerify.data, certificate->data, certificate->length);
+    memcpy(dataToVerify.data + certificate->length,
            serverNonce->data, serverNonce->length);
     retval = securityPolicy->asymmetricModule.cryptoModule.signatureAlgorithm.
         verify(channelContext, &dataToVerify, &signature->signature);
@@ -790,8 +806,11 @@ checkActivateSessionX509(UA_Server *server, UA_Session *session,
     }
 
     /* Check the user token signature */
+    /* For userTokenSignature, we must use the client certificate from the userIdentityToken,
+     * not the server certificate */
     res = checkCertificateSignature(server, sp, tempChannelContext,
-                                    &session->serverNonce, tokenSignature, true);
+                                    &session->serverNonce, tokenSignature, true,
+                                    &token->certificateData);
     if(res != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_SESSION(server->config.logging, session,
                                "ActivateSession: User token signature check "
@@ -873,7 +892,8 @@ Service_ActivateSession(UA_Server *server, UA_SecureChannel *channel,
             checkCertificateSignature(server, channel->securityPolicy,
                                       channel->channelContext,
                                       &session->serverNonce,
-                                      &req->clientSignature, false);
+                                      &req->clientSignature, false,
+                                      NULL); /* NULL means use server certificate */
         if(resp->responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
             UA_LOG_WARNING_SESSION(server->config.logging, session,
                                    "ActivateSession: Client signature check failed "

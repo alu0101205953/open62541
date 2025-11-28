@@ -6,6 +6,7 @@
  *    Copyright 2021 (c) Fraunhofer IOSB (Author: Jan Hermes)
  */
 
+#include <stdio.h>
 #include "open62541/types.h"
 #include "eventloop_posix.h"
 

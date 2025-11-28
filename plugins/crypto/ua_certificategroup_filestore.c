@@ -598,6 +598,47 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
         return retval;
     }
 
+    /* First, check if certificate is already in trusted directory */
+    UA_Boolean isInTrusted = UA_FALSE;
+    UA_ByteString *trustedCerts = NULL;
+    size_t trustedCertsSize = 0;
+    retval = readCertificates(&trustedCerts, &trustedCertsSize, context->trustedCertFolder);
+    if(retval == UA_STATUSCODE_GOOD) {
+        for(size_t i = 0; i < trustedCertsSize; i++) {
+            if(UA_ByteString_equal(certificate, &trustedCerts[i])) {
+                isInTrusted = UA_TRUE;
+                break;
+            }
+        }
+        /* Clean up trusted certificates array */
+        if(trustedCerts) {
+            for(size_t i = 0; i < trustedCertsSize; i++) {
+                UA_ByteString_clear(&trustedCerts[i]);
+            }
+            UA_Array_delete(trustedCerts, trustedCertsSize, &UA_TYPES[UA_TYPES_BYTESTRING]);
+        }
+    }
+
+    /* If certificate is not in trusted, save it to rejected directory */
+    if(!isInTrusted) {
+        char filename[UA_PATH_MAX] = {0};
+        retval = getCertFileName((char*)context->rejectedCertFolder.data, certificate, filename, UA_PATH_MAX);
+        if(retval == UA_STATUSCODE_GOOD) {
+            /* Check if certificate already exists in rejected */
+            if(access(filename, F_OK) != 0) {
+                /* Save certificate to rejected directory */
+                retval = writeByteStringToFile(filename, certificate);
+                if(retval == UA_STATUSCODE_GOOD && certGroup->logging) {
+                    UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                               "Certificate saved to rejected directory: %s "
+                               "(Administrator must manually move to trusted directory to trust it)",
+                               filename);
+                }
+            }
+        }
+    }
+
+    /* Verify certificate using the trust store (only trusts certificates in trusted directory) */
     retval = context->store->verifyCertificate(context->store, certificate);
     if(retval == UA_STATUSCODE_BADCERTIFICATEUNTRUSTED ||
        retval == UA_STATUSCODE_BADCERTIFICATEUSENOTALLOWED ||

@@ -18,6 +18,7 @@
 
 #include <open62541/types.h>
 #include <open62541/transport_generated.h>
+#include <stdio.h>
 
 #include "ua_server_internal.h"
 #include "../ua_types_encoding_binary.h"
@@ -287,9 +288,14 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
            const UA_UInt32 requestId, const UA_ByteString *msg) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
+
     if(channel->state != UA_SECURECHANNELSTATE_ACK_SENT &&
-       channel->state != UA_SECURECHANNELSTATE_OPEN)
+       channel->state != UA_SECURECHANNELSTATE_OPEN) {
+        UA_LOG_ERROR_CHANNEL(server->config.logging, channel,
+                               "Called open on already open or closed channel (state=%d)",
+                               channel->state);
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
     /* Decode the request */
     UA_NodeId requestType;
     UA_OpenSecureChannelRequest openSecureChannelRequest;
@@ -434,8 +440,12 @@ processMSG(UA_Server *server, UA_SecureChannel *channel,
            UA_UInt32 requestId, const UA_ByteString *msg) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
-    if(channel->state != UA_SECURECHANNELSTATE_OPEN)
+    if(channel->state != UA_SECURECHANNELSTATE_OPEN) {
+        UA_LOG_ERROR_CHANNEL(server->config.logging, channel,
+                             "processMSG: Invalid channel state %d (expected OPEN=%d)",
+                             channel->state, UA_SECURECHANNELSTATE_OPEN);
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
     /* Decode the nodeid */
     size_t offset = 0;
     UA_NodeId requestTypeId;
@@ -508,23 +518,59 @@ processSecureChannelMessage(UA_Server *server, UA_SecureChannel *channel,
                             UA_ByteString *message) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
+    UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                        "processSecureChannelMessage: Called (messagetype=%d, requestId=%u, message.length=%zu, channel->securityPolicy=%p)",
+                        messagetype, requestId, message->length, (void*)channel->securityPolicy);
+
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     switch(messagetype) {
     case UA_MESSAGETYPE_HEL:
-        UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Process a HEL message");
+        UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                            "processSecureChannelMessage: Processing HEL message "
+                            "(channel->state=%d, UA_SECURECHANNELSTATE_CONNECTED=%d, UA_SECURECHANNELSTATE_RHE_SENT=%d, "
+                            "message.length=%zu, message.data=%p)",
+                            channel->state, UA_SECURECHANNELSTATE_CONNECTED, UA_SECURECHANNELSTATE_RHE_SENT,
+                            message->length, (void*)message->data);
+        if(message->length >= 8) {
+            UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                                "processSecureChannelMessage: HEL message first 8 bytes: "
+                                "0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                                message->data[0], message->data[1], message->data[2], message->data[3],
+                                message->data[4], message->data[5], message->data[6], message->data[7]);
+        }
         retval = processHEL(server, channel, message);
+        UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                            "processSecureChannelMessage: processHEL returned %s (channel->state=%d)",
+                            UA_StatusCode_name(retval), channel->state);
         break;
     case UA_MESSAGETYPE_OPN:
-        UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Process an OPN message");
+        UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                            "processSecureChannelMessage: Processing OPN message "
+                            "(requestId=%u, message.length=%zu, channel->securityPolicy=%p)",
+                            requestId, message->length, (void*)channel->securityPolicy);
         retval = processOPN(server, channel, requestId, message);
+        UA_LOG_INFO_CHANNEL(server->config.logging, channel,
+                            "processSecureChannelMessage: processOPN returned %s",
+                            UA_StatusCode_name(retval));
         break;
     case UA_MESSAGETYPE_MSG:
-        UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Process a MSG");
+        UA_LOG_INFO_CHANNEL(server->config.logging, channel, "Process a MSG (requestId=%u, message.length=%zu)",
+                            requestId, message->length);
         retval = processMSG(server, channel, requestId, message);
+        UA_CHECK_STATUS(retval,
+            UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
+                                   "processMSG failed: %s", UA_StatusCode_name(retval));
+            return retval);
         break;
     case UA_MESSAGETYPE_CLO:
         UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Process a CLO");
         Service_CloseSecureChannel(server, channel); /* Regular close */
+        break;
+    case UA_MESSAGETYPE_ERR:
+        /* ERR messages are handled at the SecureChannel level and don't need
+         * processing here. They are already decoded in extractCompleteChunk. */
+        UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Process an ERR message (already handled)");
+        retval = UA_STATUSCODE_GOOD;
         break;
     default:
         UA_LOG_TRACE_CHANNEL(server->config.logging, channel, "Invalid message type");
@@ -532,6 +578,11 @@ processSecureChannelMessage(UA_Server *server, UA_SecureChannel *channel,
         break;
     }
     if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR_CHANNEL(server->config.logging, channel,
+                            "processSecureChannelMessage: Failed with StatusCode %s "
+                            "(messagetype=%d, requestId=%u, channel->state=%d, channel->renewState=%d)",
+                            UA_StatusCode_name(retval), messagetype, requestId,
+                            channel->state, channel->renewState);
         if(!UA_SecureChannel_isConnected(channel)) {
             UA_LOG_INFO_CHANNEL(server->config.logging, channel,
                                 "Processing the message failed. Channel already closed "
@@ -598,8 +649,12 @@ configServerSecureChannel(void *application, UA_SecureChannel *channel,
 
         UA_StatusCode res = policy->asymmetricModule.
             compareCertificateThumbprint(policy, &asymHeader->receiverCertificateThumbprint);
-        if(res != UA_STATUSCODE_GOOD)
+        if(res != UA_STATUSCODE_GOOD) {
+            UA_LOG_DEBUG(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                         "configServerSecureChannel: thumbprint mismatch for policy[%zu] URI=%.*s",
+                         i, (int)policy->policyUri.length, policy->policyUri.data);
             continue;
+        }
 
         /* We found the correct policy (except for security mode). The endpoint
          * needs to be selected by the client / server to match the security
@@ -608,18 +663,40 @@ configServerSecureChannel(void *application, UA_SecureChannel *channel,
         break;
     }
 
-    if(!securityPolicy)
+    if(!securityPolicy) {
+        UA_LOG_WARNING(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "configServerSecureChannel: no matching policy found for URI=%.*s",
+                       (int)asymHeader->securityPolicyUri.length, asymHeader->securityPolicyUri.data);
         return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
+    }
 
     /* If the sender provides a chain of certificates then we shall extract the
      * ApplicationInstanceCertificate. and ignore the extra bytes. See also: OPC
      * UA Part 6, V1.04, 6.7.2.3 Security Header, Table 42 - Asymmetric
      * algorithm Security header */
+    UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                "configServerSecureChannel: BEFORE getLeafCertificate - senderCertificate.length=%zu bytes, data=%p",
+                asymHeader->senderCertificate.length, (void*)asymHeader->senderCertificate.data);
     UA_ByteString appInstCert = getLeafCertificate(asymHeader->senderCertificate);
+
+    UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                "configServerSecureChannel: AFTER getLeafCertificate - client certificate length=%zu bytes, data=%p",
+                appInstCert.length, (void*)appInstCert.data);
 
     /* Create the channel context and parse the sender (remote) certificate used
      * for the secureChannel. */
-    return UA_SecureChannel_setSecurityPolicy(channel, securityPolicy, &appInstCert);
+    UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                "configServerSecureChannel: About to call UA_SecureChannel_setSecurityPolicy "
+                "(securityPolicy=%p, appInstCert.length=%zu)",
+                (void*)securityPolicy, appInstCert.length);
+    UA_StatusCode res = UA_SecureChannel_setSecurityPolicy(channel, securityPolicy, &appInstCert);
+    UA_LOG_INFO(server->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                "configServerSecureChannel: UA_SecureChannel_setSecurityPolicy returned %s, "
+                "channel->channelContext=%p, channel->securityPolicy=%p",
+                UA_StatusCode_name(res), (void*)channel->channelContext, (void*)channel->securityPolicy);
+    
+    
+    return res;
 }
 
 static UA_StatusCode
@@ -782,6 +859,7 @@ serverNetworkCallbackLocked(UA_ConnectionManager *cm, uintptr_t connectionId,
         return;
     }
 
+    /* Determine if this is a server socket or a secure channel */
     UA_ServerConnection *sc = (UA_ServerConnection*)*connectionContext;
     UA_SecureChannel *channel = (UA_SecureChannel*)*connectionContext;
     UA_Boolean serverSocket = (sc >= bpm->serverConnections &&
@@ -831,6 +909,9 @@ serverNetworkCallbackLocked(UA_ConnectionManager *cm, uintptr_t connectionId,
         /* Set the channel state to CONNECTED until the HEL message is received */
         channel->state = UA_SECURECHANNELSTATE_CONNECTED;
 
+        UA_LOG_INFO(bpm->sc.server->config.logging, UA_LOGCATEGORY_SERVER,
+                    "TCP %lu\t| New connection accepted - SecureChannel created",
+                    (unsigned long)connectionId);
         UA_LOG_INFO_CHANNEL(bpm->logging, channel, "SecureChannel created");
     }
 
@@ -842,36 +923,121 @@ serverNetworkCallbackLocked(UA_ConnectionManager *cm, uintptr_t connectionId,
     UA_debug_dumpCompleteChunk(server, channel->connection, message);
 #endif
 
+    if(bpm->logging) {
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: Received message (msg.length=%zu, channel->state=%d, renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p)",
+                             msg.length, channel->state, channel->renewState, (void*)channel->securityPolicy, (void*)channel->channelContext);
+    }
+    if(msg.length > 0 && msg.data) {
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: First 16 bytes of message: 0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                             msg.data[0], msg.data[1], msg.data[2], msg.data[3],
+                             msg.data[4], msg.data[5], msg.data[6], msg.data[7],
+                             msg.data[8], msg.data[9], msg.data[10], msg.data[11],
+                             msg.data[12], msg.data[13], msg.data[14], msg.data[15]);
+    }
+
     UA_EventLoop *el = bpm->sc.server->config.eventLoop;
     UA_DateTime nowMonotonic = el->dateTime_nowMonotonic(el);
 
     /* Process all complete messages */
+    UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                         "serverNetworkCallbackLocked: About to call UA_SecureChannel_loadBuffer (msg.length=%zu, channel->state=%d, renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p)",
+                         msg.length, channel->state, channel->renewState, (void*)channel->securityPolicy, (void*)channel->channelContext);
     retval = UA_SecureChannel_loadBuffer(channel, msg);
+    UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                         "serverNetworkCallbackLocked: UA_SecureChannel_loadBuffer returned %s (msg.length=%zu, channel->state=%d, renewState=%d)",
+                         UA_StatusCode_name(retval), msg.length, channel->state, channel->renewState);
+    UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                         "serverNetworkCallbackLocked: Entering while loop (retval=%s, UA_STATUSCODE_GOOD=%d)",
+                         UA_StatusCode_name(retval), UA_STATUSCODE_GOOD);
     while(UA_LIKELY(retval == UA_STATUSCODE_GOOD)) {
         UA_MessageType messageType;
         UA_UInt32 requestId = 0;
         UA_ByteString payload = UA_BYTESTRING_NULL;
         UA_Boolean copied = false;
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: About to call UA_SecureChannel_getCompleteMessage "
+                             "(channel->state=%d, channel->renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p)",
+                             channel->state, channel->renewState, (void*)channel->securityPolicy, (void*)channel->channelContext);
         retval = UA_SecureChannel_getCompleteMessage(channel, &messageType, &requestId,
                                                      &payload, &copied, nowMonotonic);
-        if(retval != UA_STATUSCODE_GOOD || payload.length == 0)
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: UA_SecureChannel_getCompleteMessage returned %s (payload.length=%zu, messageType=%d=0x%x='%c%c%c%c', requestId=%u, channel->securityPolicy=%p)",
+                             UA_StatusCode_name(retval), payload.length, messageType, messageType,
+                             (char)(messageType & 0xFF), (char)((messageType >> 8) & 0xFF),
+                             (char)((messageType >> 16) & 0xFF), (char)((messageType >> 24) & 0xFF),
+                             requestId, (void*)channel->securityPolicy);
+        if(retval != UA_STATUSCODE_GOOD || payload.length == 0) {
+            if(retval != UA_STATUSCODE_GOOD) {
+                fprintf(stderr, "[ERROR] serverNetworkCallbackLocked: ✗✗✗ UA_SecureChannel_getCompleteMessage failed: %s "
+                        "(channel->state=%d, channel->renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p). "
+                        "This usually means unpackPayloadMSG or decryptAndVerifyChunk failed. "
+                        "The symmetric keys might not be initialized.\n",
+                        UA_StatusCode_name(retval), channel->state, channel->renewState, 
+                        (void*)channel->securityPolicy, (void*)channel->channelContext);
+                UA_LOG_ERROR_CHANNEL(bpm->logging, channel,
+                                     "serverNetworkCallbackLocked: ✗✗✗ UA_SecureChannel_getCompleteMessage failed: %s "
+                                     "(channel->state=%d, channel->renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p). "
+                                     "This usually means unpackPayloadMSG or decryptAndVerifyChunk failed. "
+                                     "The symmetric keys might not be initialized.",
+                                     UA_StatusCode_name(retval), channel->state, channel->renewState, 
+                                     (void*)channel->securityPolicy, (void*)channel->channelContext);
+                
+                /* For PQC policies, check if shared secret is available */
+                if(channel->securityPolicy && channel->securityPolicy->policyContext) {
+                    /* Log additional info about policy context */
+                    UA_LOG_ERROR_CHANNEL(bpm->logging, channel,
+                                         "serverNetworkCallbackLocked: Policy context available: %p, "
+                                         "channel context: %p",
+                                         (void*)channel->securityPolicy->policyContext,
+                                         (void*)channel->channelContext);
+                }
+            } else {
+                UA_LOG_DEBUG_CHANNEL(bpm->logging, channel,
+                                     "serverNetworkCallbackLocked: UA_SecureChannel_getCompleteMessage returned GOOD but payload.length=0 (no complete message yet)");
+            }
             break;
+        }
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: ✓ Got complete message (messageType=%d, requestId=%u, payload.length=%zu, channel->state=%d)",
+                             messageType, requestId, payload.length, channel->state);
         retval = processSecureChannelMessage(bpm->sc.server, channel,
                                              messageType, requestId, &payload);
+        UA_LOG_INFO_CHANNEL(bpm->logging, channel,
+                             "serverNetworkCallbackLocked: processSecureChannelMessage returned %s (messageType=%d, requestId=%u)",
+                             UA_StatusCode_name(retval), messageType, requestId);
         if(copied)
             UA_ByteString_clear(&payload);
     }
     retval |= UA_SecureChannel_persistBuffer(channel);
 
     if(retval != UA_STATUSCODE_GOOD) {
-        UA_LOG_WARNING_CHANNEL(bpm->logging, channel,
-                               "Processing the message failed with error %s",
-                               UA_StatusCode_name(retval));
+        fprintf(stderr, "[ERROR] serverNetworkCallbackLocked: ✗✗✗ Processing the message failed with error %s "
+                "(channel->state=%d, channel->renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p). "
+                "This usually means UA_SecureChannel_getCompleteMessage failed because unpackPayloadMSG or decryptAndVerifyChunk failed. "
+                "The symmetric keys might not be initialized. Sending ERR.\n",
+                UA_StatusCode_name(retval), channel->state, channel->renewState,
+                (void*)channel->securityPolicy, (void*)channel->channelContext);
+        if(bpm->logging) {
+            UA_LOG_ERROR_CHANNEL(bpm->logging, channel,
+                                  "✗✗✗ serverNetworkCallbackLocked: Processing the message failed with error %s "
+                                  "(channel->state=%d, channel->renewState=%d, channel->securityPolicy=%p, channel->channelContext=%p). "
+                                  "This usually means UA_SecureChannel_getCompleteMessage failed because unpackPayloadMSG or decryptAndVerifyChunk failed. "
+                                  "The symmetric keys might not be initialized.",
+                                  UA_StatusCode_name(retval), channel->state, channel->renewState,
+                                  (void*)channel->securityPolicy, (void*)channel->channelContext);
+        }
 
         /* Send an ERR message and close the connection */
         UA_TcpErrorMessage error;
         error.error = retval;
         error.reason = UA_STRING_NULL;
+        if(bpm->logging) {
+            UA_LOG_ERROR_CHANNEL(bpm->logging, channel,
+                                   "✗✗✗ serverNetworkCallbackLocked: Sending ERR message to client (error=%s)",
+                    UA_StatusCode_name(retval));
+        }
         UA_SecureChannel_sendError(channel, &error);
         UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_ABORT);
     }

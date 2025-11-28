@@ -323,7 +323,7 @@ calculateAsymAlgSecurityHeaderLength(const UA_SecureChannel *channel);
 
 UA_StatusCode
 prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
-                   const UA_Byte *buf_end, size_t totalLength,
+                   const UA_Byte *payload_start, size_t totalLength,
                    size_t securityHeaderLength, UA_UInt32 requestId,
                    size_t *const finalLength);
 
@@ -345,7 +345,7 @@ padChunk(UA_SecureChannel *channel, const UA_SecurityPolicyCryptoModule *cm,
 UA_StatusCode
 signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
                    UA_ByteString *buf, size_t securityHeaderLength,
-                   size_t totalLength);
+                   size_t totalLength, const UA_Byte *payload_start);
 
 UA_StatusCode
 signAndEncryptSym(UA_MessageContext *messageContext,

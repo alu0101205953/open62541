@@ -135,7 +135,18 @@ if(UA_ENABLE_ENCRYPTION OR
    UA_ENABLE_ENCRYPTION STREQUAL "MBEDTLS" OR
    UA_ENABLE_ENCRYPTION STREQUAL "OPENSSL")
     add_example(server_encryption encryption/server_encryption.c)
-    add_example(server_encryption_filestore encryption/server_encryption_filestore.c)
+    # Filestore helper solo está disponible en Linux y Windows
+    if((UNIX AND NOT APPLE) OR WIN32)
+        add_example(server_encryption_filestore encryption/server_encryption_filestore.c)
+    endif()
+    # PQC PKI filestore (works on Linux, Windows, and macOS)
+    # Note: server_encryption_filestore_pqc.c and client_encryption_pqc_pki.c are not yet available
+    # if(UA_ENABLE_ENCRYPTION STREQUAL "OPENSSL")
+    #     add_example(server_encryption_filestore_pqc encryption/server_encryption_filestore_pqc.c)
+    #     add_example(client_encryption_pqc_pki encryption/client_encryption_pqc_pki.c)
+    #     target_include_directories(server_encryption_filestore_pqc PRIVATE "${PROJECT_SOURCE_DIR}/examples")
+    #     target_include_directories(client_encryption_pqc_pki PRIVATE "${PROJECT_SOURCE_DIR}/examples")
+    # endif()
     add_example(client_encryption encryption/client_encryption.c)
     add_example(pqc encryption/pqc.c)
     target_include_directories(server_encryption PRIVATE "${PROJECT_SOURCE_DIR}/examples")
