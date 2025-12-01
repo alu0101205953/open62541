@@ -45,6 +45,8 @@ static void stopHandler(int sig) {
 int main(int argc, char* argv[]) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
+    /* Ignore SIGPIPE to prevent broken pipe errors when output is redirected to pipes */
+    signal(SIGPIPE, SIG_IGN);
     UA_ByteString certificate = UA_BYTESTRING_NULL;
     UA_ByteString privateKey = UA_BYTESTRING_NULL;
     bool onlySecure = false;
@@ -55,6 +57,17 @@ int main(int argc, char* argv[]) {
     if(argc >= 3) {
             certificate = loadFile(argv[1]);
             privateKey = loadFile(argv[2]);
+            
+            /* Validate that files were loaded successfully */
+            if(certificate.length == 0 || privateKey.length == 0) {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to load certificate or private key file.");
+                if(certificate.length > 0)
+                    UA_ByteString_clear(&certificate);
+                if(privateKey.length > 0)
+                    UA_ByteString_clear(&privateKey);
+                return EXIT_FAILURE;
+            }
     } else {
         /* Generate PQC certificate directly (requires OpenSSL 3.0+ and OQS Provider) */
         UA_String subject[3] = {UA_STRING_STATIC("C=DE"),
@@ -108,8 +121,12 @@ int main(int argc, char* argv[]) {
             const char *defaultCertPath = "server_cert_pqc.der";
             const char *defaultKeyPath = "server_key_pqc.der";
             
-            writeFile(defaultCertPath, certificate);
-            writeFile(defaultKeyPath, privateKey);
+            UA_StatusCode certWriteStatus = writeFile(defaultCertPath, certificate);
+            UA_StatusCode keyWriteStatus = writeFile(defaultKeyPath, privateKey);
+            if(certWriteStatus != UA_STATUSCODE_GOOD || keyWriteStatus != UA_STATUSCODE_GOOD) {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                              "Failed to save auto-generated certificate files to disk.");
+            }
         }
     }
 #endif
@@ -181,6 +198,16 @@ int main(int argc, char* argv[]) {
     size_t revocationListSize = 0;
 
     UA_Server *server = UA_Server_new();
+    if(!server) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to create server.");
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
+        return EXIT_FAILURE;
+    }
     UA_ServerConfig *config = UA_Server_getConfig(server);
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
@@ -290,10 +317,9 @@ int main(int argc, char* argv[]) {
         UA_ByteString clientKemKey = loadFile(clientKemKeyFile);
         if(clientSigKey.length == (size_t)OQS_SIG_dilithium_2_length_public_key &&
            clientKemKey.length == (size_t)OQS_KEM_kyber_768_length_public_key) {
-            size_t idx = config->securityPoliciesSize;
-            if(idx > 0)
-                idx--;
+            /* Validate that security policies exist before accessing */
             if(config->securityPolicies && config->securityPoliciesSize > 0) {
+                size_t idx = config->securityPoliciesSize - 1; /* Last policy (PQC) */
                 UA_StatusCode rc =
                     UA_PQCPolicy_registerRemoteKeys(&config->securityPolicies[idx],
                                                     clientSigKey, clientKemKey);
@@ -302,6 +328,9 @@ int main(int argc, char* argv[]) {
                                    "Failed to register client PQC keys override: %s",
                                    UA_StatusCode_name(rc));
                 }
+            } else {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                               "No security policies available to register client PQC keys.");
             }
         } else {
             UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
@@ -313,12 +342,14 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    /* Check retval before cleaning up resources */
+    if(retval != UA_STATUSCODE_GOOD)
+        goto cleanup;
+    
     UA_ByteString_clear(&certificate);
     UA_ByteString_clear(&privateKey);
     for(size_t i = 0; i < trustListSize; i++)
         UA_ByteString_clear(&trustList[i]);
-    if(retval != UA_STATUSCODE_GOOD)
-        goto cleanup;
 
     if(!running)
         goto cleanup; /* received ctrl-c already */

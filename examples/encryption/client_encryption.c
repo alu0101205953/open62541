@@ -27,12 +27,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
 
 #include "common.h"
 
 #define MIN_ARGS 4
 
 int main(int argc, char* argv[]) {
+    /* Ignore SIGPIPE to prevent broken pipe errors when output is redirected to pipes */
+    signal(SIGPIPE, SIG_IGN);
+    
     UA_ByteString certificate = UA_BYTESTRING_NULL;
     UA_ByteString privateKey = UA_BYTESTRING_NULL;
     char *endpointUrl = NULL;
@@ -43,6 +47,17 @@ int main(int argc, char* argv[]) {
         /* Load certificate and private key */
         certificate = loadFile(argv[2]);
         privateKey = loadFile(argv[3]);
+        
+        /* Validate that files were loaded successfully */
+        if(certificate.length == 0 || privateKey.length == 0) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                "Failed to load certificate or private key file.");
+            if(certificate.length > 0)
+                UA_ByteString_clear(&certificate);
+            if(privateKey.length > 0)
+                UA_ByteString_clear(&privateKey);
+            return EXIT_FAILURE;
+        }
     } else {
         /* Generate PQC certificate directly (requires OpenSSL 3.0+ and OQS Provider) */
         UA_String subject[3] = {UA_STRING_STATIC("C=DE"),
@@ -73,7 +88,7 @@ int main(int argc, char* argv[]) {
                 "Alternatively, provide certificate files: "
                 "<client-certificate.der> <client-private-key.der>");
             return EXIT_FAILURE;
-    }
+        }
 
         endpointUrl = "opc.tcp://localhost:4840";
     }
@@ -142,8 +157,12 @@ int main(int argc, char* argv[]) {
                 const char *defaultCertPath = "client_cert_pqc.der";
                 const char *defaultKeyPath = "client_key_pqc.der";
                 
-            writeFile(defaultCertPath, certificate);
-            writeFile(defaultKeyPath, privateKey);
+            UA_StatusCode certWriteStatus = writeFile(defaultCertPath, certificate);
+            UA_StatusCode keyWriteStatus = writeFile(defaultKeyPath, privateKey);
+            if(certWriteStatus != UA_STATUSCODE_GOOD || keyWriteStatus != UA_STATUSCODE_GOOD) {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                              "Failed to save auto-generated certificate files to disk.");
+            }
                 }
             }
     
@@ -162,6 +181,17 @@ int main(int argc, char* argv[]) {
 #endif
 
     UA_Client *client = UA_Client_new();
+    if(!client) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to create client.");
+        /* Clean up resources before exiting */
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
+        return EXIT_FAILURE;
+    }
     UA_ClientConfig *cc = UA_Client_getConfig(client);
     
     /* Increase buffer limits to avoid rejected messages with large PQC certificates */
@@ -188,12 +218,23 @@ int main(int argc, char* argv[]) {
             }
             
             if(!alreadyInTrustList) {
-                trustList[trustListSize] = serverCert;
-                trustListSize++;
+                /* Validate array bounds before adding */
+                const size_t maxTrustListSize = trustListSize + 2; /* Array size */
+                if(trustListSize >= maxTrustListSize) {
+                    UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                                "Trust list is full, cannot add server certificate.");
+                    UA_ByteString_clear(&serverCert);
+                } else {
+                    trustList[trustListSize] = serverCert;
+                    trustListSize++;
+                }
             } else {
                 UA_ByteString_clear(&serverCert);
             }
-            }
+        } else {
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                          "Failed to load server certificate file: %s", serverCertFile);
+        }
     }
     
     UA_StatusCode retval = UA_ClientConfig_setDefaultEncryption(cc, certificate, privateKey,
@@ -203,6 +244,12 @@ int main(int argc, char* argv[]) {
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "Failed to set encryption." );
+        /* Clean up resources before exiting */
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
@@ -229,6 +276,11 @@ int main(int argc, char* argv[]) {
     if(!cc->securityPolicies) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Memory allocation failed for PQC policy");
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
@@ -240,6 +292,14 @@ int main(int argc, char* argv[]) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Failed to initialize PQC SecurityPolicy: %s",
                      UA_StatusCode_name(retval));
+        UA_free(cc->securityPolicies);
+        cc->securityPolicies = NULL;
+        cc->securityPoliciesSize = 0;
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
@@ -265,10 +325,39 @@ int main(int argc, char* argv[]) {
         cc->endpoint.transportProfileUri = UA_String_fromChars(
             "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary");
         cc->endpoint.serverCertificate = loadFile(serverCertFile);
+        
+        /* Validate that server certificate was loaded successfully */
+        if(cc->endpoint.serverCertificate.length == 0) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "Failed to load server certificate file: %s", serverCertFile);
+            UA_String_clear(&cc->endpoint.endpointUrl);
+            UA_String_clear(&cc->endpoint.transportProfileUri);
+            UA_Client_delete(client);
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            for(size_t i = 0; i < trustListSize; i++) {
+                UA_ByteString_clear(&trustList[i]);
+            }
+            return EXIT_FAILURE;
+        }
 
         /* Configure user identity with certificate */
         cc->endpoint.userIdentityTokens = (UA_UserTokenPolicy *)
             UA_Array_new(1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+        if(!cc->endpoint.userIdentityTokens) {
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "Memory allocation failed for user identity tokens");
+            UA_String_clear(&cc->endpoint.endpointUrl);
+            UA_String_clear(&cc->endpoint.transportProfileUri);
+            UA_ByteString_clear(&cc->endpoint.serverCertificate);
+            UA_Client_delete(client);
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            for(size_t i = 0; i < trustListSize; i++) {
+                UA_ByteString_clear(&trustList[i]);
+            }
+            return EXIT_FAILURE;
+        }
         cc->endpoint.userIdentityTokensSize = 1;
         cc->endpoint.userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_CERTIFICATE;
         cc->endpoint.userIdentityTokens[0].policyId = UA_String_fromChars("open62541-certificate-policy-sign+encrypt#PQC");
@@ -294,6 +383,19 @@ int main(int argc, char* argv[]) {
         if(!cc->authSecurityPolicies) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Memory allocation failed for PQC auth policy");
+            UA_String_clear(&cc->endpoint.endpointUrl);
+            UA_String_clear(&cc->endpoint.transportProfileUri);
+            UA_ByteString_clear(&cc->endpoint.serverCertificate);
+            if(cc->endpoint.userIdentityTokens) {
+                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
+                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
+                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+            }
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            for(size_t i = 0; i < trustListSize; i++) {
+                UA_ByteString_clear(&trustList[i]);
+            }
             UA_Client_delete(client);
             return EXIT_FAILURE;
         }
@@ -305,6 +407,22 @@ int main(int argc, char* argv[]) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Failed to initialize PQC Auth SecurityPolicy: %s",
                         UA_StatusCode_name(retval));
+            UA_free(cc->authSecurityPolicies);
+            cc->authSecurityPolicies = NULL;
+            cc->authSecurityPoliciesSize = 0;
+            UA_String_clear(&cc->endpoint.endpointUrl);
+            UA_String_clear(&cc->endpoint.transportProfileUri);
+            UA_ByteString_clear(&cc->endpoint.serverCertificate);
+            if(cc->endpoint.userIdentityTokens) {
+                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
+                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
+                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+            }
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            for(size_t i = 0; i < trustListSize; i++) {
+                UA_ByteString_clear(&trustList[i]);
+            }
             UA_Client_delete(client);
             return EXIT_FAILURE;
         }
@@ -317,6 +435,20 @@ int main(int argc, char* argv[]) {
         cc->endpoint.userIdentityTokensSize = 0;
         cc->endpoint.userIdentityTokens = (UA_UserTokenPolicy *)
             UA_Array_new(1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
+        if(!cc->endpoint.userIdentityTokens) {
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "Memory allocation failed for user identity tokens");
+            UA_String_clear(&cc->endpoint.endpointUrl);
+            UA_String_clear(&cc->endpoint.transportProfileUri);
+            UA_ByteString_clear(&cc->endpoint.serverCertificate);
+            UA_Client_delete(client);
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            for(size_t i = 0; i < trustListSize; i++) {
+                UA_ByteString_clear(&trustList[i]);
+            }
+            return EXIT_FAILURE;
+        }
         cc->endpoint.userIdentityTokensSize = 1;
 
         cc->endpoint.userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_CERTIFICATE;
@@ -334,6 +466,12 @@ int main(int argc, char* argv[]) {
 
     retval = UA_Client_connect(client, endpointUrl);
     if(retval != UA_STATUSCODE_GOOD) {
+        /* Clean up resources before exiting */
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
@@ -356,13 +494,25 @@ int main(int argc, char* argv[]) {
        UA_Variant_hasScalarType(&value, &UA_TYPES[UA_TYPES_DATETIME])) {
         UA_DateTime raw_date = *(UA_DateTime *)value.data;
         UA_DateTimeStruct dts = UA_DateTime_toStruct(raw_date);
-        fprintf(stdout, "\n");
-        fprintf(stdout, "═══════════════════════════════════════════════════════════════\n");
-        fprintf(stdout, "SUCCESS: Received server value\n");
-        fprintf(stdout, "  Server date: %u-%u-%u %u:%u:%u.%03u\n",
+        /* Check return values to handle broken pipe gracefully */
+        int result1 = fprintf(stdout, "\n");
+        int result2 = fprintf(stdout, "═══════════════════════════════════════════════════════════════\n");
+        int result3 = fprintf(stdout, "SUCCESS: Received server value\n");
+        int result4 = fprintf(stdout, "  Server date: %u-%u-%u %u:%u:%u.%03u\n",
                 dts.day, dts.month, dts.year, dts.hour, dts.min, dts.sec, dts.milliSec);
-        fprintf(stdout, "═══════════════════════════════════════════════════════════════\n");
-        fprintf(stdout, "\n");
+        int result5 = fprintf(stdout, "═══════════════════════════════════════════════════════════════\n");
+        int result6 = fprintf(stdout, "\n");
+        
+        if(result1 < 0 || result2 < 0 || result3 < 0 || result4 < 0 || result5 < 0 || result6 < 0) {
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                          "Failed to write output to stdout (broken pipe or I/O error). "
+                          "This may occur when output is redirected to a pipe that closes early.");
+        } else {
+            if(fflush(stdout) != 0) {
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                              "Failed to flush stdout (broken pipe or I/O error).");
+            }
+        }
     }
 
     /* Clean up */
