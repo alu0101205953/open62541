@@ -148,7 +148,8 @@ if(UA_ENABLE_ENCRYPTION OR
     #     target_include_directories(client_encryption_pqc_pki PRIVATE "${PROJECT_SOURCE_DIR}/examples")
     # endif()
     add_example(client_encryption encryption/client_encryption.c)
-    add_example(pqc encryption/pqc.c)
+    # pqc.c example is not available
+    # add_example(pqc encryption/pqc.c)
     target_include_directories(server_encryption PRIVATE "${PROJECT_SOURCE_DIR}/examples")
     target_include_directories(client_encryption PRIVATE "${PROJECT_SOURCE_DIR}/examples")
     if(UA_ENABLE_TPM2_KEYSTORE)
