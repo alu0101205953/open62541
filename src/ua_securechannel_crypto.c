@@ -159,7 +159,7 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
 
     if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
-        *encryptedLength = totalLength;
+        *encryptedLength = 4 + securityHeaderLength + UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH + totalLength;
     } else {
         /* Check if this is PQC policy (doesn't use block-based encryption) */
         static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");

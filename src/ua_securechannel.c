@@ -738,32 +738,16 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
         return res;
     }
 
-    /* After decryption, for PQC policy, pqc_decrypt moves the decrypted data to the start of cipher.data
-     * (which is chunk->data + offset_before_decrypt). The decrypted data now starts at chunk->data + offset_before_decrypt.
-     * We need to adjust chunk->bytes.data to point to where the decrypted data starts, and adjust the offset accordingly.
-     * 
-     * IMPORTANT: After decryptAndVerifyChunk, chunk->bytes.length includes:
-     *   - Headers (offset_before_decrypt)
-     *   - Decrypted data (cipher.length after pqc_decrypt)
-     *   - Minus signature and padding (already subtracted in decryptAndVerifyChunk)
-     * 
-     * So chunk->bytes.length = offset_before_decrypt + decrypted_length - sigsize - padSize
-     * After adjusting chunk->bytes.data to point to decrypted data, we need to update chunk->bytes.length
-     * to only include the decrypted data (without headers, signature, and padding). */
-    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
-    UA_Boolean isPqcPolicy = channel->securityPolicy && 
-                             UA_String_equal(&channel->securityPolicy->policyUri, &pqcPolicyUri);
-    if(isPqcPolicy) {
-        /* For PQC, pqc_decrypt moves the decrypted data to cipher.data (which is chunk->data + offset_before_decrypt).
-         * chunk->bytes.data currently points to chunk->data, but the decrypted data is at chunk->data + offset_before_decrypt.
-         * chunk->bytes.length currently includes headers + decrypted data - signature - padding.
-         * After adjusting chunk->bytes.data to point to decrypted data, chunk->bytes.length should be
-         * the length of the decrypted data only (without headers, signature, and padding).
-         * So we subtract offset_before_decrypt from chunk->bytes.length. */
-        chunk->bytes.data = (UA_Byte*)((uintptr_t)chunk->bytes.data + offset_before_decrypt);
-        chunk->bytes.length -= offset_before_decrypt;
-        offset = 0; /* Now decoding from the start of the decrypted data */
+    if(chunk->bytes.length <= offset_before_decrypt) {
+        UA_LOG_WARNING_CHANNEL(channel->securityPolicy->logger, channel,
+                               "unpackPayloadOPN: Invalid chunk length after decryptAndVerifyChunk (length=%zu, offset=%zu)",
+                               chunk->bytes.length, offset_before_decrypt);
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
     }
+
+    chunk->bytes.data = (UA_Byte*)((uintptr_t)chunk->bytes.data + offset_before_decrypt);
+    chunk->bytes.length -= offset_before_decrypt;
+    offset = 0;
 
     /* Decode the SequenceHeader */
     UA_SequenceHeader sequenceHeader;
