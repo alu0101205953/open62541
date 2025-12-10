@@ -1628,23 +1628,37 @@ createSessionAsync(UA_Client *client) {
 
 static UA_StatusCode
 initSecurityPolicy(UA_Client *client) {
-    /* Find the SecurityPolicy */
-    UA_SecurityPolicy *sp =
-        getSecurityPolicy(client, client->endpoint.securityPolicyUri);
-
-    /* Unknown SecurityPolicy -- we would never select such an endpoint */
-    if(!sp)
-        return UA_STATUSCODE_BADINTERNALERROR;
+    UA_SecurityPolicy *sp = NULL;
+    
+    /* If endpoint is not configured or server certificate is not available,
+     * use SecurityPolicyNone for discovery */
+    UA_Boolean useNoneForDiscovery = endpointUnconfigured(&client->endpoint) ||
+        client->endpoint.serverCertificate.length == 0;
+    
+    if(useNoneForDiscovery) {
+        static const UA_String noneUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+        sp = getSecurityPolicy(client, noneUri);
+        if(!sp) {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                          "SecurityPolicyNone not available for discovery");
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+    } else {
+        /* Find the SecurityPolicy from endpoint */
+        sp = getSecurityPolicy(client, client->endpoint.securityPolicyUri);
+        if(!sp)
+            return UA_STATUSCODE_BADINTERNALERROR;
+        
+        client->channel.securityMode = client->endpoint.securityMode;
+        if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
+            client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+    }
 
     /* Already initialized -- check we are using the configured SecurityPolicy */
     if(client->channel.securityPolicy)
         return (client->channel.securityPolicy == sp) ?
             UA_STATUSCODE_GOOD : UA_STATUSCODE_BADINTERNALERROR;
-
-    /* Set the SecurityMode -- none if no endpoint is selected so far */
-    client->channel.securityMode = client->endpoint.securityMode;
-    if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
-        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
 
     /* Instantiate the SecurityPolicy context with the remote certificate */
     return UA_SecureChannel_setSecurityPolicy(&client->channel, sp,

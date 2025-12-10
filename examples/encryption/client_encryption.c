@@ -5,6 +5,7 @@
 #include <open62541/client_highlevel.h>
 #include <open62541/plugin/log_stdout.h>
 #include <open62541/plugin/securitypolicy.h>
+#include <open62541/plugin/securitypolicy_default.h>
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 #include <open62541/plugin/create_certificate.h>
@@ -261,21 +262,20 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
-    /* Replace default policy with PQC - MUST be done AFTER UA_ClientConfig_setDefaultEncryption
+    /* Add SecurityPolicyNone and PQC - MUST be done AFTER UA_ClientConfig_setDefaultEncryption
      * because that function sets up authSecurityPolicies */
     
-    /* First, replace securityPolicies */
     if(cc->securityPolicies) {
         UA_free(cc->securityPolicies);
         cc->securityPolicies = NULL;
         cc->securityPoliciesSize = 0;
     }
 
-    cc->securityPoliciesSize = 1;
-    cc->securityPolicies = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
+    cc->securityPoliciesSize = 2;
+    cc->securityPolicies = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy) * 2);
     if(!cc->securityPolicies) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Memory allocation failed for PQC policy");
+                     "Memory allocation failed for security policies");
         UA_ByteString_clear(&certificate);
         UA_ByteString_clear(&privateKey);
         for(size_t i = 0; i < trustListSize; i++) {
@@ -285,13 +285,35 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    retval = UA_SecurityPolicy_PQC(&cc->securityPolicies[0],
+    memset(&cc->securityPolicies[0], 0, sizeof(UA_SecurityPolicy));
+    memset(&cc->securityPolicies[1], 0, sizeof(UA_SecurityPolicy));
+
+    retval = UA_SecurityPolicy_None(&cc->securityPolicies[0],
+                                    UA_BYTESTRING_NULL, UA_Log_Stdout);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Failed to initialize SecurityPolicyNone: %s",
+                     UA_StatusCode_name(retval));
+        UA_free(cc->securityPolicies);
+        cc->securityPolicies = NULL;
+        cc->securityPoliciesSize = 0;
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        for(size_t i = 0; i < trustListSize; i++) {
+            UA_ByteString_clear(&trustList[i]);
+        }
+        UA_Client_delete(client);
+        return EXIT_FAILURE;
+    }
+
+    retval = UA_SecurityPolicy_PQC(&cc->securityPolicies[1],
                                    certificate, privateKey,
                                    UA_Log_Stdout);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Failed to initialize PQC SecurityPolicy: %s",
                      UA_StatusCode_name(retval));
+        cc->securityPolicies[0].clear(&cc->securityPolicies[0]);
         UA_free(cc->securityPolicies);
         cc->securityPolicies = NULL;
         cc->securityPoliciesSize = 0;
