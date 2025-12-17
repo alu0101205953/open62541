@@ -288,6 +288,9 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
            const UA_UInt32 requestId, const UA_ByteString *msg) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: enter (state=%d, requestId=%u, msgLen=%zu)",
+                         channel->state, requestId, msg ? msg->length : 0);
 
     if(channel->state != UA_SECURECHANNELSTATE_ACK_SENT &&
        channel->state != UA_SECURECHANNELSTATE_OPEN) {
@@ -300,15 +303,19 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     UA_NodeId requestType;
     UA_OpenSecureChannelRequest openSecureChannelRequest;
     size_t offset = 0;
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: decoding RequestType NodeId (offset=%zu)", offset);
     UA_StatusCode retval = UA_NodeId_decodeBinary(msg, &offset, &requestType);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_NodeId_clear(&requestType);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the NodeId. "
-                               "Closing the SecureChannel.");
-        UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
+                               "Could not decode the NodeId (retval=%s). "
+                               "Returning error to caller.",
+                               UA_StatusCode_name(retval));
         return retval;
     }
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: decoding OpenSecureChannelRequest (offset=%zu)", offset);
     retval = UA_decodeBinaryInternal(msg, &offset, &openSecureChannelRequest,
                                      &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST], NULL);
 
@@ -319,9 +326,10 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
         UA_NodeId_clear(&requestType);
         UA_OpenSecureChannelRequest_clear(&openSecureChannelRequest);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the OPN message. "
-                               "Closing the SecureChannel.");
-        UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
+                               "Could not decode the OPN message (retval=%s, requestId match=%d). "
+                               "Returning error to caller.",
+                               UA_StatusCode_name(retval),
+                               UA_NodeId_equal(&requestType, opnRequestId));
         return retval;
     }
     UA_NodeId_clear(&requestType);
@@ -334,7 +342,8 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     if(openScResponse.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
                                "Could not open a SecureChannel. "
-                               "Closing the connection.");
+                               "Closing the connection. serviceResult=%s",
+                               UA_StatusCode_name(openScResponse.responseHeader.serviceResult));
         UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
         return openScResponse.responseHeader.serviceResult;
     }

@@ -2315,6 +2315,7 @@ initConnect(UA_Client *client) {
 
     /* Initialize the SecureChannel */
     UA_SecureChannel_clear(&client->channel);
+    client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
     client->channel.config = client->config.localConnectionConfig;
     client->channel.certificateVerification = &client->config.certificateVerification;
     client->channel.processOPNHeader = verifyClientSecureChannelHeader;

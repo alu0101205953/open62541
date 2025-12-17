@@ -72,6 +72,10 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
     /* Create the context */
     UA_ByteString emptyCert = UA_BYTESTRING_NULL;
     const UA_ByteString *certForContext = allowEmptyCert ? &emptyCert : remoteCertificate;
+    /* For SecurityPolicy#None, enforce MessageSecurityMode None before creating the context */
+    if(UA_String_equal(&securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI))
+        channel->securityMode = UA_MESSAGESECURITYMODE_NONE;
+
     UA_StatusCode res = securityPolicy->channelModule.
         newContext(securityPolicy, certForContext, &channel->channelContext);
     
@@ -104,6 +108,7 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
 
     /* Set the policy */
     channel->securityPolicy = securityPolicy;
+
     return UA_STATUSCODE_GOOD;
 }
 
@@ -676,7 +681,14 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
     
     UA_assert(chunk->bytes.length >= UA_SECURECHANNEL_MESSAGE_MIN_LENGTH);
-    
+    UA_LOG_TRACE_CHANNEL(logger, channel,
+                         "unpackPayloadOPN: enter (state=%d, connId=%lu, bytes.len=%zu, securityPolicy=%p, channelContext=%p)",
+                         (int)channel->state,
+                         (unsigned long)channel->connectionId,
+                         chunk->bytes.length,
+                         (void*)channel->securityPolicy,
+                         (void*)channel->channelContext);
+
     size_t offset = UA_SECURECHANNEL_MESSAGEHEADER_LENGTH; /* Skip the message header */
     UA_UInt32 secureChannelId;
     UA_StatusCode res = UA_UInt32_decodeBinary(&chunk->bytes, &offset, &secureChannelId);
@@ -687,9 +699,14 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     
     /* Check if we have enough data */
     if(offset >= chunk->bytes.length) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "unpackPayloadOPN: invalid arguments (offset=%zu, len=%zu)",
+                     offset, chunk->bytes.length);
         return UA_STATUSCODE_BADINVALIDARGUMENT;
     }
     
+    UA_LOG_TRACE_CHANNEL(logger, channel,
+                         "unpackPayloadOPN: decoding AsymmetricAlgorithmSecurityHeader (offset=%zu)", offset);
     res = UA_decodeBinaryInternal(&chunk->bytes, &offset, &asymHeader,
              &UA_TRANSPORT[UA_TRANSPORT_ASYMMETRICALGORITHMSECURITYHEADER], NULL);
     UA_CHECK_STATUS(res,
@@ -702,6 +719,9 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     
 
     if(asymHeader.senderCertificate.length > 0) {
+        UA_LOG_TRACE_CHANNEL(logger, channel,
+                             "unpackPayloadOPN: verify senderCertificate (len=%zu)",
+                             asymHeader.senderCertificate.length);
         if(channel->certificateVerification && channel->certificateVerification->verifyCertificate) {
             res = channel->certificateVerification->
                 verifyCertificate(channel->certificateVerification,
@@ -723,6 +743,9 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
 
     /* New channel, create a security policy context and attach */
     UA_assert(channel->processOPNHeader);
+    UA_LOG_TRACE_CHANNEL(logger, channel,
+                         "unpackPayloadOPN: calling processOPNHeader (policyUri.len=%zu)",
+                         channel->securityPolicy ? channel->securityPolicy->policyUri.length : 0);
     res = channel->processOPNHeader(channel->processOPNHeaderApplication,
                                     channel, &asymHeader);
     UA_CHECK_STATUS(res, goto error);
@@ -764,6 +787,12 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
 
     /* Check the header for the channel's security policy */
     res = checkAsymHeader(channel, &asymHeader);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(channel->securityPolicy ? channel->securityPolicy->logger : NULL,
+                     UA_LOGCATEGORY_SECURITYPOLICY,
+                     "unpackPayloadOPN: checkAsymHeader failed: %s",
+                     UA_StatusCode_name(res));
+    }
     UA_AsymmetricAlgorithmSecurityHeader_clear(&asymHeader);
     UA_CHECK_STATUS(res, return res);
 
@@ -780,6 +809,9 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
                      (void*)channel->channelContext);
         return UA_STATUSCODE_BADINTERNALERROR;
     }
+    UA_LOG_TRACE_CHANNEL(channel->securityPolicy->logger, channel,
+                         "unpackPayloadOPN: decryptAndVerifyChunk (offset=%zu, bytes.len=%zu, securityMode=%d)",
+                         offset, chunk->bytes.length, (int)channel->securityMode);
     size_t offset_before_decrypt = offset;
     res = decryptAndVerifyChunk(channel,
                                 &channel->securityPolicy->asymmetricModule.cryptoModule,
@@ -847,6 +879,10 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     return UA_STATUSCODE_GOOD;
 
 error:
+    UA_LOG_ERROR(channel->securityPolicy ? channel->securityPolicy->logger : NULL,
+                 UA_LOGCATEGORY_SECURITYPOLICY,
+                 "unpackPayloadOPN: returning error %s",
+                 UA_StatusCode_name(res));
     UA_AsymmetricAlgorithmSecurityHeader_clear(&asymHeader);
     return res;
 }
