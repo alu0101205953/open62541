@@ -671,6 +671,14 @@ decryptAndVerifyChunk(const UA_SecureChannel *channel,
     /* Decrypt the chunk */
     UA_StatusCode res = UA_STATUSCODE_GOOD;
     const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
+
+    /* For SecurityPolicy#None and MessageSecurityMode None, OPN carries no
+     * encryption/signature. Skip crypto entirely. */
+    if(messageType == UA_MESSAGETYPE_OPN &&
+       channel->securityPolicy &&
+       UA_String_equal(&channel->securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI) &&
+       channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
+        return UA_STATUSCODE_GOOD;
     
     if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT ||
        messageType == UA_MESSAGETYPE_OPN) {
@@ -758,6 +766,9 @@ checkAsymHeader(UA_SecureChannel *channel,
     if(!sp) {
         return UA_STATUSCODE_BADINTERNALERROR;
     }
+    /* For SecurityPolicy#None, accept the header without thumbprint checks */
+    if(UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI))
+        return UA_STATUSCODE_GOOD;
     if(!UA_String_equal(&sp->policyUri, &asymHeader->securityPolicyUri))
         return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
 

@@ -398,9 +398,47 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
      * = (payload_start - buf.data) + payload_length + sigsize */
     total_length = pre_sig_length + sigsize;
 
+    /* Log header/message size before sign/encrypt */
+    UA_TcpMessageHeader tmpHdr;
+    size_t tmpOff = 0;
+    UA_decodeBinaryInternal(&buf, &tmpOff, &tmpHdr,
+                            &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
+    size_t bytesUsedBeforeSign = (uintptr_t)buf_pos - (uintptr_t)buf.data;
+    UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pre-sign: messageSize=%u bytesUsed=%zu payloadLen=%zu header+seq=%zu",
+                tmpHdr.messageSize, bytesUsedBeforeSign, payload_length,
+                (size_t)(payload_start - buf.data) + UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH);
+
     res = signAndEncryptAsym(channel, pre_sig_length, &buf,
                              securityHeaderLength, total_length, payload_start);
     UA_CHECK_STATUS(res, goto error);
+
+    /* After sign/encrypt: adjust send length to the messageSize from header */
+    size_t finalLen = buf.length;
+    tmpOff = 0;
+    UA_decodeBinaryInternal(&buf, &tmpOff, &tmpHdr,
+                            &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
+    if(tmpHdr.messageSize <= buf.length)
+        buf.length = tmpHdr.messageSize;
+    UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pre-send: messageSize=%u finalLen=%zu sendLen=%zu",
+                tmpHdr.messageSize, finalLen, buf.length);
+    size_t hexLen = finalLen * 3 + 1;
+    char *hexBuf = (char*)UA_malloc(hexLen);
+    if(hexBuf) {
+        char *p = hexBuf;
+        for(size_t i = 0; i < finalLen; i++) {
+            int n = snprintf(p, hexLen - (size_t)(p - hexBuf),
+                             "%02X%s", buf.data[i], (i + 1 == finalLen) ? "" : " ");
+            if(n < 0 || (size_t)n >= hexLen - (size_t)(p - hexBuf))
+                break;
+            p += n;
+        }
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] pre-send hex (%zu bytes): %s",
+                    finalLen, hexBuf);
+        UA_free(hexBuf);
+    }
 
     /* Send the message, the buffer is freed in the network layer */
     /* For PQC policy, signAndEncryptAsym reallocates the buffer and updates buf.length

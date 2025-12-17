@@ -304,20 +304,34 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     UA_OpenSecureChannelRequest openSecureChannelRequest;
     size_t offset = 0;
     UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
-                         "processOPN: decoding RequestType NodeId (offset=%zu)", offset);
+                         "processOPN: decoding RequestType NodeId (offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     UA_StatusCode retval = UA_NodeId_decodeBinary(msg, &offset, &requestType);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: UA_NodeId_decodeBinary retval=%s offset=%zu remaining=%zu",
+                         UA_StatusCode_name(retval),
+                         offset, msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_NodeId_clear(&requestType);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the NodeId (retval=%s). "
+                               "Could not decode the NodeId (retval=%s, offset=%zu, remaining=%zu). "
                                "Returning error to caller.",
-                               UA_StatusCode_name(retval));
+                               UA_StatusCode_name(retval), offset,
+                               msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
         return retval;
     }
     UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
-                         "processOPN: decoding OpenSecureChannelRequest (offset=%zu)", offset);
+                         "processOPN: NodeId decoded ok, next offset=%zu, remaining=%zu",
+                         offset, msg ? msg->length - offset : 0);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: decoding OpenSecureChannelRequest (offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     retval = UA_decodeBinaryInternal(msg, &offset, &openSecureChannelRequest,
                                      &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST], NULL);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: UA_decodeBinaryInternal(OpenSecureChannelRequest) retval=%s offset=%zu remaining=%zu",
+                         UA_StatusCode_name(retval),
+                         offset, msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
 
     /* Error occurred */
     const UA_NodeId *opnRequestId =
@@ -326,19 +340,29 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
         UA_NodeId_clear(&requestType);
         UA_OpenSecureChannelRequest_clear(&openSecureChannelRequest);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the OPN message (retval=%s, requestId match=%d). "
+                               "Could not decode the OPN message (retval=%s, requestId match=%d, offset=%zu, remaining=%zu). "
                                "Returning error to caller.",
                                UA_StatusCode_name(retval),
-                               UA_NodeId_equal(&requestType, opnRequestId));
+                               UA_NodeId_equal(&requestType, opnRequestId),
+                               offset,
+                               msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
         return retval;
     }
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: OpenSecureChannelRequest decoded ok (final offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     UA_NodeId_clear(&requestType);
 
     /* Call the service */
     UA_OpenSecureChannelResponse openScResponse;
     UA_OpenSecureChannelResponse_init(&openScResponse);
+    /* For the first OPN (channel not open yet), do not enforce any prior
+     * requestId expectation; use the received requestId as-is. */
     Service_OpenSecureChannel(server, channel, &openSecureChannelRequest, &openScResponse);
     UA_OpenSecureChannelRequest_clear(&openSecureChannelRequest);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: Service_OpenSecureChannel result=%s",
+                         UA_StatusCode_name(openScResponse.responseHeader.serviceResult));
     if(openScResponse.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
                                "Could not open a SecureChannel. "
@@ -351,6 +375,9 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     /* Send the response */
     retval = UA_SecureChannel_sendAsymmetricOPNMessage(channel, requestId, &openScResponse,
                                                        &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: sending OpenSecureChannelResponse retval=%s",
+                         UA_StatusCode_name(retval));
     UA_OpenSecureChannelResponse_clear(&openScResponse);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
