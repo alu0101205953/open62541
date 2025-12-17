@@ -46,9 +46,22 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
                                    UA_SecurityPolicy *securityPolicy,
                                    const UA_ByteString *remoteCertificate) {
     /* Is a policy already configured? */
-    UA_CHECK_ERROR(!channel->securityPolicy, return UA_STATUSCODE_BADINTERNALERROR,
-                   securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
-                   "Security policy already configured");
+    if(channel->securityPolicy) {
+        UA_LOG_ERROR(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] UA_SecureChannel_setSecurityPolicy: Security policy already configured. "
+                     "channel.state=%d, channel.securityPolicy=%p, "
+                     "new_securityPolicy=%p, "
+                     "channel.securityPolicy->policyUri.length=%zu, "
+                     "new_securityPolicy->policyUri.length=%zu, "
+                     "remoteCertificate.length=%zu",
+                     (int)channel->state,
+                     (void*)channel->securityPolicy,
+                     (void*)securityPolicy,
+                     channel->securityPolicy ? channel->securityPolicy->policyUri.length : 0,
+                     securityPolicy ? securityPolicy->policyUri.length : 0,
+                     remoteCertificate ? remoteCertificate->length : 0);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     /* For PQC policies, allow empty certificate during initial OPN handshake.
      * The certificate will be set later when it's received. */
@@ -292,7 +305,17 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
         return UA_STATUSCODE_BADCONNECTIONCLOSED;
 
     const UA_SecurityPolicy *sp = channel->securityPolicy;
-    UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
+    if(!sp) {
+        UA_LOG_ERROR(channel->securityPolicy ? channel->securityPolicy->logger : NULL,
+                     UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] UA_SecureChannel_sendAsymmetricOPNMessage: channel->securityPolicy is NULL. "
+                     "channel.state=%d, channel.connectionId=%lu, "
+                     "channel.securityMode=%d",
+                     (int)channel->state,
+                     (unsigned long)channel->connectionId,
+                     (int)channel->securityMode);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     /* Allocate the message buffer */
     UA_ByteString buf = UA_BYTESTRING_NULL;
@@ -679,6 +702,15 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
                 verifyCertificate(channel->certificateVerification,
                                   &asymHeader.senderCertificate);
         } else {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                         "[BADINTERNALERROR] unpackPayloadOPN: certificateVerification missing. "
+                         "channel.state=%d, channel.securityPolicy=%p, "
+                         "certificateVerification=%p, "
+                         "senderCertificate.length=%zu",
+                         (int)channel->state,
+                         (void*)channel->securityPolicy,
+                         (void*)channel->certificateVerification,
+                         asymHeader.senderCertificate.length);
             res = UA_STATUSCODE_BADINTERNALERROR;
         }
         UA_CHECK_STATUS(res, goto error);
@@ -692,6 +724,14 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
     
     /* Verify that the security policy was configured */
     if(!channel->securityPolicy) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] unpackPayloadOPN: security policy not configured after processOPNHeader. "
+                     "channel.state=%d, channel.connectionId=%lu, "
+                     "processOPNHeader=%p, processOPNHeaderApplication=%p",
+                     (int)channel->state,
+                     (unsigned long)channel->connectionId,
+                     (void*)channel->processOPNHeader,
+                     (void*)channel->processOPNHeaderApplication);
         res = UA_STATUSCODE_BADINTERNALERROR;
         goto error;
     }
@@ -724,6 +764,15 @@ unpackPayloadOPN(UA_SecureChannel *channel, UA_Chunk *chunk) {
 
     /* Decrypt the chunk payload */
     if(!channel->securityPolicy || !channel->channelContext) {
+        UA_LOG_ERROR(channel->securityPolicy ? channel->securityPolicy->logger : NULL,
+                     UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] unpackPayloadOPN: securityPolicy or channelContext is NULL. "
+                     "channel.state=%d, channel.connectionId=%lu, "
+                     "channel.securityPolicy=%p, channel.channelContext=%p",
+                     (int)channel->state,
+                     (unsigned long)channel->connectionId,
+                     (void*)channel->securityPolicy,
+                     (void*)channel->channelContext);
         return UA_STATUSCODE_BADINTERNALERROR;
     }
     size_t offset_before_decrypt = offset;
@@ -800,7 +849,16 @@ error:
 static UA_StatusCode
 unpackPayloadMSG(UA_SecureChannel *channel, UA_Chunk *chunk,
                  UA_DateTime nowMonotonic) {
-    UA_CHECK_MEM(channel->securityPolicy, return UA_STATUSCODE_BADINTERNALERROR);
+    if(!channel->securityPolicy) {
+        UA_LOG_ERROR(NULL, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] unpackPayloadMSG: channel->securityPolicy is NULL. "
+                     "channel.state=%d, channel.connectionId=%lu, "
+                     "channel.channelContext=%p",
+                     (int)channel->state,
+                     (unsigned long)channel->connectionId,
+                     (void*)channel->channelContext);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
 
     UA_assert(chunk->bytes.length >= UA_SECURECHANNEL_MESSAGE_MIN_LENGTH);

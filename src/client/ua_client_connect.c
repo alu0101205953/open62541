@@ -17,6 +17,7 @@
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
 #include <open62541/plugin/securitypolicy_pqc.h>
 #endif
+#include <open62541/plugin/securitypolicy_default.h>
 
 /* Some OPC UA servers only return all Endpoints if the EndpointURL used during
  * the HEL/ACK handshake exactly matches -- including the path following the
@@ -111,12 +112,27 @@ getAuthSecurityPolicy(UA_Client *client, UA_String policyUri) {
     return NULL;
 }
 
-/* The endpoint is unconfigured if the description is all zeroed-out */
+/* The endpoint is unconfigured if the description is all zeroed-out.
+ * Also consider it unconfigured if it requires PQC policy but server certificate
+ * is not available (needs GetEndpoints to obtain it). */
 static UA_Boolean
 endpointUnconfigured(const UA_EndpointDescription *endpoint) {
     UA_EndpointDescription tmp;
     UA_EndpointDescription_init(&tmp);
-    return UA_equal(&tmp, endpoint, &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    UA_Boolean isZeroed = UA_equal(&tmp, endpoint, &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    if(isZeroed)
+        return true;
+    
+    /* Check if endpoint requires PQC but certificate is missing */
+    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    static const UA_String nonePolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+    if(UA_String_equal(&endpoint->securityPolicyUri, &pqcPolicyUri) &&
+       !UA_String_equal(&endpoint->securityPolicyUri, &nonePolicyUri) &&
+       endpoint->serverCertificate.length == 0) {
+        return true; /* Needs GetEndpoints to obtain server certificate */
+    }
+    
+    return false;
 }
 
 UA_Boolean
@@ -675,6 +691,20 @@ processOPNResponse(UA_Client *client, const UA_ByteString *message) {
 static void
 sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     if(!UA_SecureChannel_isConnected(&client->channel)) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "[BADINTERNALERROR] sendOPNAsync: SecureChannel not connected. "
+                     "channel.state=%d, channel.connectionId=%lu, "
+                     "channel.securityPolicy=%p, "
+                     "endpoint.securityPolicyUri.length=%zu, "
+                     "endpoint.serverCertificate.length=%zu, "
+                     "tempNonePolicy=%p, renew=%d",
+                     (int)client->channel.state,
+                     (unsigned long)client->channel.connectionId,
+                     (void*)client->channel.securityPolicy,
+                     client->endpoint.securityPolicyUri.length,
+                     client->endpoint.serverCertificate.length,
+                     (void*)client->tempNonePolicy,
+                     (int)renew);
         client->connectStatus = UA_STATUSCODE_BADINTERNALERROR;
         return;
     }
@@ -1628,23 +1658,163 @@ createSessionAsync(UA_Client *client) {
 
 static UA_StatusCode
 initSecurityPolicy(UA_Client *client) {
-    /* Find the SecurityPolicy */
+    /* Handle case when endpoint is not yet configured (securityPolicyUri.length == 0).
+     * This occurs during initial connection before GetEndpoints provides endpoint information.
+     * In this case, we need SecurityPolicy#None for discovery, but it may not be available
+     * in client->config.securityPolicies for PQC-only clients. */
+    static const UA_String nonePolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+    if(client->endpoint.securityPolicyUri.length == 0) {
+        /* Reentrancy guard: already initialized with SecurityPolicy#None */
+        if(client->channel.securityPolicy &&
+           UA_String_equal(&client->channel.securityPolicy->policyUri, &nonePolicyUri))
+            return UA_STATUSCODE_GOOD;
+
+        /* Endpoint not configured yet - need SecurityPolicy#None for discovery */
+        UA_SecurityPolicy *noneSp = NULL;
+        for(size_t i = 0; i < client->config.securityPoliciesSize; i++) {
+            if(UA_String_equal(&nonePolicyUri, &client->config.securityPolicies[i].policyUri)) {
+                noneSp = &client->config.securityPolicies[i];
+                break;
+            }
+        }
+        if(!noneSp) {
+            /* SecurityPolicy#None is not available in client config.
+             * Create a temporary instance for discovery phase only.
+             * This instance is owned by this client and will be cleaned up in UA_Client_clear(). */
+            
+            /* Create temporary SecurityPolicy#None if not already created */
+            if(!client->tempNonePolicy) {
+                client->tempNonePolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
+                if(!client->tempNonePolicy)
+                    return UA_STATUSCODE_BADOUTOFMEMORY;
+                
+                UA_StatusCode retval = UA_SecurityPolicy_None(client->tempNonePolicy,
+                                                             UA_BYTESTRING_NULL,
+                                                             client->config.logging);
+                if(retval != UA_STATUSCODE_GOOD) {
+                    UA_free(client->tempNonePolicy);
+                    client->tempNonePolicy = NULL;
+                    return retval;
+                }
+            }
+            
+            /* Set SecurityMode to NONE for discovery */
+            client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+            
+            /* Initialize with temporary None policy and empty certificate */
+            UA_StatusCode retval = UA_SecureChannel_setSecurityPolicy(&client->channel,
+                                                                       client->tempNonePolicy,
+                                                                       &UA_BYTESTRING_NULL);
+            if(retval != UA_STATUSCODE_GOOD)
+                return retval;
+            
+            return UA_STATUSCODE_GOOD;
+        }
+        /* SecurityPolicy#None is available in config - use it */
+        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+        return UA_SecureChannel_setSecurityPolicy(&client->channel, noneSp,
+                                                  &UA_BYTESTRING_NULL);
+    }
+
+    /* Endpoint is configured - find the SecurityPolicy */
     UA_SecurityPolicy *sp =
         getSecurityPolicy(client, client->endpoint.securityPolicyUri);
 
     /* Unknown SecurityPolicy -- we would never select such an endpoint */
-    if(!sp)
+    if(!sp) {
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "[BADINTERNALERROR] initSecurityPolicy: Unknown SecurityPolicy. "
+                     "channel.state=%d, channel.securityPolicy=%p, "
+                     "endpoint.securityPolicyUri.length=%zu, "
+                     "endpoint.serverCertificate.length=%zu, "
+                     "tempNonePolicy=%p",
+                     (int)client->channel.state,
+                     (void*)client->channel.securityPolicy,
+                     client->endpoint.securityPolicyUri.length,
+                     client->endpoint.serverCertificate.length,
+                     (void*)client->tempNonePolicy);
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     /* Already initialized -- check we are using the configured SecurityPolicy */
-    if(client->channel.securityPolicy)
-        return (client->channel.securityPolicy == sp) ?
-            UA_STATUSCODE_GOOD : UA_STATUSCODE_BADINTERNALERROR;
+    if(client->channel.securityPolicy) {
+        if(client->channel.securityPolicy != sp) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "[BADINTERNALERROR] initSecurityPolicy: SecurityPolicy mismatch. "
+                         "channel.state=%d, channel.securityPolicy=%p, expected_sp=%p, "
+                         "channel.securityPolicy->policyUri.length=%zu, "
+                         "sp->policyUri.length=%zu, "
+                         "endpoint.securityPolicyUri.length=%zu, "
+                         "endpoint.serverCertificate.length=%zu, "
+                         "tempNonePolicy=%p",
+                         (int)client->channel.state,
+                         (void*)client->channel.securityPolicy,
+                         (void*)sp,
+                         client->channel.securityPolicy ? client->channel.securityPolicy->policyUri.length : 0,
+                         sp ? sp->policyUri.length : 0,
+                         client->endpoint.securityPolicyUri.length,
+                         client->endpoint.serverCertificate.length,
+                         (void*)client->tempNonePolicy);
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+        return UA_STATUSCODE_GOOD;
+    }
 
     /* Set the SecurityMode -- none if no endpoint is selected so far */
     client->channel.securityMode = client->endpoint.securityMode;
     if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
         client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+
+    /* For PQC policies, require server certificate to be available.
+     * If not available, use SecurityPolicy#None for discovery phase.
+     * The endpoint description is preserved, so GetEndpoints will detect
+     * the policy mismatch and trigger reconnection with PQC after obtaining
+     * the server certificate. */
+    static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    if(UA_String_equal(&sp->policyUri, &pqcPolicyUri) &&
+       client->endpoint.serverCertificate.length == 0) {
+        /* Use SecurityPolicy#None for discovery instead of PQC */
+        UA_SecurityPolicy *noneSp = NULL;
+        for(size_t i = 0; i < client->config.securityPoliciesSize; i++) {
+            if(UA_String_equal(&nonePolicyUri, &client->config.securityPolicies[i].policyUri)) {
+                noneSp = &client->config.securityPolicies[i];
+                break;
+            }
+        }
+        if(!noneSp) {
+            /* SecurityPolicy#None is not available in client config.
+             * Create a temporary instance for discovery phase only.
+             * This instance is owned by this client and will be cleaned up in UA_Client_clear(). */
+            
+            /* Create temporary SecurityPolicy#None if not already created */
+            if(!client->tempNonePolicy) {
+                client->tempNonePolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
+                if(!client->tempNonePolicy)
+                    return UA_STATUSCODE_BADOUTOFMEMORY;
+                
+                UA_StatusCode retval = UA_SecurityPolicy_None(client->tempNonePolicy,
+                                                             UA_BYTESTRING_NULL,
+                                                             client->config.logging);
+                if(retval != UA_STATUSCODE_GOOD) {
+                    UA_free(client->tempNonePolicy);
+                    client->tempNonePolicy = NULL;
+                    return retval;
+                }
+            }
+            
+            /* Initialize with temporary None policy and empty certificate */
+            UA_StatusCode retval = UA_SecureChannel_setSecurityPolicy(&client->channel,
+                                                                       client->tempNonePolicy,
+                                                                       &UA_BYTESTRING_NULL);
+            if(retval != UA_STATUSCODE_GOOD)
+                return retval;
+            
+            return UA_STATUSCODE_GOOD;
+        }
+        /* Initialize with None policy from config and empty certificate (allowed for None) */
+        return UA_SecureChannel_setSecurityPolicy(&client->channel, noneSp,
+                                                  &UA_BYTESTRING_NULL);
+    }
 
     /* Instantiate the SecurityPolicy context with the remote certificate */
     return UA_SecureChannel_setSecurityPolicy(&client->channel, sp,

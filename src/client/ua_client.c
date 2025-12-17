@@ -250,6 +250,13 @@ UA_Client_clear(UA_Client *client) {
     /* Clean up the SecureChannel */
     UA_SecureChannel_clear(&client->channel);
 
+    /* Clean up temporary SecurityPolicy#None if it was created for discovery */
+    if(client->tempNonePolicy) {
+        client->tempNonePolicy->clear(client->tempNonePolicy);
+        UA_free(client->tempNonePolicy);
+        client->tempNonePolicy = NULL;
+    }
+
     /* Free the namespace mapping */
     UA_Array_delete(client->namespaces, client->namespacesSize,
                     &UA_TYPES[UA_TYPES_STRING]);

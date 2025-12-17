@@ -159,6 +159,11 @@ struct UA_Client {
     UA_ByteString serverSessionNonce;
     UA_ByteString clientSessionNonce;
 
+    /* Temporary SecurityPolicy#None for discovery phase when PQC client lacks server certificate.
+     * Owned exclusively by this client instance. Created in initSecurityPolicy() if needed,
+     * cleaned up in UA_Client_clear() after SecureChannel is cleared. */
+    UA_SecurityPolicy *tempNonePolicy;
+
     /* For authentication with an ECC SecurityPolicy. This is needed to save the
      * server's ephemeral public key between the session creation (when the key
      * is received) and session activation, when the key is used. */

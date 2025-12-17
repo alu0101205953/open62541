@@ -159,7 +159,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
 
     if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
-        *encryptedLength = totalLength;
+        /* For SecurityPolicy#None there is no encryption/signature, but the
+         * message size must still include all headers (TCP + SecureChannel +
+         * SequenceHeader) plus the payload. Previously only the payload length
+         * was reported, leading to a truncated messageSize in the OPN chunk. */
+        *encryptedLength = totalLength +
+            UA_SECURECHANNEL_CHANNELHEADER_LENGTH +
+            securityHeaderLength +
+            UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
     } else {
         /* Check if this is PQC policy (doesn't use block-based encryption) */
         static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
