@@ -2935,11 +2935,19 @@ pqc_sign(void *context, const UA_ByteString *message, UA_ByteString *signature) 
     if(!sig) return UA_STATUSCODE_BADOUTOFMEMORY;
 
     size_t siglen = 0;
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pqc_sign: before sign alg=Dilithium2 msgLen=%zu sigBufLen=%zu",
+                message->length, signature->length);
+
     OQS_STATUS rc = OQS_SIG_sign(sig, signature->data, &siglen,
                                  message->data, message->length, pc->sigPrivateKey);
 
     signature->length = (size_t)siglen;
     OQS_SIG_free(sig);
+
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pqc_sign: after sign alg=Dilithium2 rc=%d sigLen=%zu",
+                (int)rc, signature->length);
 
     if(rc != OQS_SUCCESS) {
         UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,

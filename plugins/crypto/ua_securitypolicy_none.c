@@ -90,6 +90,18 @@ static UA_StatusCode
 newContext_none(const UA_SecurityPolicy *securityPolicy,
                 const UA_ByteString *remoteCertificate,
                 void **channelContext) {
+    /* Allocate a trivial context to satisfy the invariant that channelContext
+     * is non-NULL after UA_SecureChannel_setSecurityPolicy. No data stored. */
+    (void)securityPolicy;
+    (void)remoteCertificate;
+    if(!channelContext)
+        return UA_STATUSCODE_BADINTERNALERROR;
+
+    void *ctx = UA_calloc(1, sizeof(uint8_t));
+    if(!ctx)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+
+    *channelContext = ctx;
     return UA_STATUSCODE_GOOD;
 }
 

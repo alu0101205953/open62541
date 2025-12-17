@@ -590,6 +590,13 @@ void
 processOPNResponse(UA_Client *client, const UA_ByteString *message) {
     /* Is the content of the expected type? */
     size_t offset = 0;
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] processOPNResponse: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
+                 (int)client->channel.state,
+                 (int)endpointUnconfigured(&client->endpoint),
+                 client->endpoint.securityPolicyUri.length,
+                 client->discoveryUrl.length,
+                 UA_StatusCode_name(client->connectStatus));
     UA_NodeId responseId;
     UA_NodeId expectedId = UA_NS0ID(OPENSECURECHANNELRESPONSE_ENCODING_DEFAULTBINARY);
     UA_StatusCode retval = UA_NodeId_decodeBinary(message, &offset, &responseId);
@@ -708,6 +715,15 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
         client->connectStatus = UA_STATUSCODE_BADINTERNALERROR;
         return;
     }
+
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] sendOPNAsync: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s renew=%d",
+                 (int)client->channel.state,
+                 (int)endpointUnconfigured(&client->endpoint),
+                 client->endpoint.securityPolicyUri.length,
+                 client->discoveryUrl.length,
+                 UA_StatusCode_name(client->connectStatus),
+                 (int)renew);
 
     client->connectStatus =
         UA_SecureChannel_generateLocalNonce(&client->channel);
@@ -1274,6 +1290,14 @@ responseGetEndpoints(UA_Client *client, void *userdata,
                      UA_UInt32 requestId, void *response) {
     UA_LOCK_ASSERT(&client->clientMutex);
 
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] responseGetEndpoints: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
+                 (int)client->channel.state,
+                 (int)endpointUnconfigured(&client->endpoint),
+                 client->endpoint.securityPolicyUri.length,
+                 client->discoveryUrl.length,
+                 UA_StatusCode_name(client->connectStatus));
+
     client->endpointsHandshake = false;
 
     UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
@@ -1396,7 +1420,27 @@ responseGetEndpoints(UA_Client *client, void *userdata,
     if(client->endpoint.securityMode != client->channel.securityMode ||
        !UA_String_equal(&client->endpoint.securityPolicyUri,
                         &client->channel.securityPolicy->policyUri)) {
+        /* Planned reconnect with different SecurityPolicy/Mode.
+         * Preserve the selected endpoint across the channel restart
+         * to avoid re-entering discovery loop. */
+        UA_EndpointDescription preservedEndpoint;
+        UA_EndpointDescription_init(&preservedEndpoint);
+        UA_StatusCode copyRc =
+            UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
+        if(copyRc != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                           "Failed to preserve endpoint for reconnect (%s). "
+                           "Keeping current endpoint.",
+                           UA_StatusCode_name(copyRc));
+            return;
+        }
+
         closeSecureChannel(client);
+
+        UA_EndpointDescription_clear(&client->endpoint);
+        client->endpoint = preservedEndpoint;
+        /* Clear discoveryUrl so next connectActivity does not re-enter discovery */
+        UA_String_clear(&client->discoveryUrl);
         return;
     }
 
@@ -1405,7 +1449,27 @@ responseGetEndpoints(UA_Client *client, void *userdata,
      * was selected, then we use the endpointUrl for the HEL message. */
     if(client->discoveryUrl.length > 0 &&
        !UA_String_equal(&client->discoveryUrl, &client->endpoint.endpointUrl)) {
+        /* Planned reconnect switching away from discovery URL.
+         * Preserve the selected endpoint across the channel restart
+         * to avoid re-entering discovery loop. */
+        UA_EndpointDescription preservedEndpoint;
+        UA_EndpointDescription_init(&preservedEndpoint);
+        UA_StatusCode copyRc =
+            UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
+        if(copyRc != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                           "Failed to preserve endpoint for reconnect (%s). "
+                           "Keeping current endpoint.",
+                           UA_StatusCode_name(copyRc));
+            return;
+        }
+
         closeSecureChannel(client);
+
+        UA_EndpointDescription_clear(&client->endpoint);
+        client->endpoint = preservedEndpoint;
+        /* Clear discoveryUrl so next connectActivity does not re-enter discovery */
+        UA_String_clear(&client->discoveryUrl);
         return;
     }
 
@@ -1416,6 +1480,14 @@ responseGetEndpoints(UA_Client *client, void *userdata,
 static UA_StatusCode
 requestGetEndpoints(UA_Client *client) {
     UA_LOCK_ASSERT(&client->clientMutex);
+
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] requestGetEndpoints: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
+                 (int)client->channel.state,
+                 (int)endpointUnconfigured(&client->endpoint),
+                 client->endpoint.securityPolicyUri.length,
+                 client->discoveryUrl.length,
+                 UA_StatusCode_name(client->connectStatus));
 
     UA_GetEndpointsRequest request;
     UA_GetEndpointsRequest_init(&request);
@@ -1765,6 +1837,11 @@ initSecurityPolicy(UA_Client *client) {
     if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
         client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
 
+    /* If the active SecurityPolicy is None, force MessageSecurityMode None.
+     * Discovery OPN must use None/None per OPC UA spec. */
+    if(UA_String_equal(&sp->policyUri, &nonePolicyUri))
+        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
+
     /* For PQC policies, require server certificate to be available.
      * If not available, use SecurityPolicy#None for discovery phase.
      * The endpoint description is preserved, so GetEndpoints will detect
@@ -1824,6 +1901,13 @@ initSecurityPolicy(UA_Client *client) {
 static void
 connectActivity(UA_Client *client) {
     UA_LOCK_ASSERT(&client->clientMutex);
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] connectActivity: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
+                 (int)client->channel.state,
+                 (int)endpointUnconfigured(&client->endpoint),
+                 client->endpoint.securityPolicyUri.length,
+                 client->discoveryUrl.length,
+                 UA_StatusCode_name(client->connectStatus));
     UA_LOG_TRACE(client->config.logging, UA_LOGCATEGORY_CLIENT,
                  "Client connect iterate");
 
@@ -1893,8 +1977,10 @@ connectActivity(UA_Client *client) {
     }
 
     /* GetEndpoints to identify the remote side and/or reset the SecureChannel
-     * with encryption */
-    if(endpointUnconfigured(&client->endpoint)) {
+     * with encryption. Only when the SecureChannel is open; otherwise sending
+     * a symmetric request will fail (channel not yet open). */
+    if(endpointUnconfigured(&client->endpoint) &&
+       client->channel.state == UA_SECURECHANNELSTATE_OPEN) {
         client->connectStatus = requestGetEndpoints(client);
         return;
     }
@@ -2720,6 +2806,13 @@ closeSecureChannel(UA_Client *client) {
     /* If we close SecureChannel when the Session is still active, set to
      * created. Otherwise the Session would remain active until the connection
      * callback is called for the closing connection. */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE] closeSecureChannel: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
+                (int)client->channel.state,
+                (int)endpointUnconfigured(&client->endpoint),
+                client->endpoint.securityPolicyUri.length,
+                client->discoveryUrl.length,
+                UA_StatusCode_name(client->connectStatus));
     if(client->sessionState == UA_SESSIONSTATE_ACTIVATED)
         client->sessionState = UA_SESSIONSTATE_CREATED;
 

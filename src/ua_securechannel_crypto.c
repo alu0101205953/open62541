@@ -158,6 +158,11 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     const UA_SecurityPolicy *sp = channel->securityPolicy;
     UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
 
+    UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] prependHeadersAsym: policyUri=%S securityMode=%d totalLen=%zu secHdrLen=%zu requestId=%u",
+                sp->policyUri, (int)channel->securityMode, totalLength,
+                securityHeaderLength, requestId);
+
     if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
         /* For SecurityPolicy#None there is no encryption/signature, but the
          * message size must still include all headers (TCP + SecureChannel +
@@ -431,9 +436,15 @@ signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
         
         UA_ByteString dataToSign = {signedLength, signBuffer};
         UA_ByteString signature = {sigsize, buf->data + preSignLength};
-        
+
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym(PQC): policyUri=%S securityMode=%d signedLen=%zu sigSize=%zu",
+                    sp->policyUri, (int)channel->securityMode, signedLength, sigsize);
+
         UA_StatusCode retval = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             sign(channel->channelContext, &dataToSign, &signature);
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym(PQC): sign rc=%s", UA_StatusCode_name(retval));
         UA_free(signBuffer);
         UA_CHECK_STATUS(retval, return retval);
         
@@ -499,8 +510,15 @@ signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
             getLocalSignatureSize(channel->channelContext);
         UA_ByteString dataToSign = {preSignLength, buf->data};
         UA_ByteString signature = {sigsize, buf->data + preSignLength};
+
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym: policyUri=%S securityMode=%d signedLen=%zu sigSize=%zu",
+                    sp->policyUri, (int)channel->securityMode, preSignLength, sigsize);
+
         UA_StatusCode retval = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             sign(channel->channelContext, &dataToSign, &signature);
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym: sign rc=%s", UA_StatusCode_name(retval));
         UA_CHECK_STATUS(retval, return retval);
         
         /* Specification part 6, 6.7.4: The OpenSecureChannel Messages are

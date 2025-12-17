@@ -363,6 +363,11 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
         sigsize = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             getLocalSignatureSize(channel->channelContext);
     
+    UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] UA_SecureChannel_sendAsymmetricOPNMessage: policyUri=%S securityMode=%d payloadLen=%zu sigSize=%zu sigAlg=%S",
+                sp->policyUri, (int)channel->securityMode, payload_length, sigsize,
+                sp->asymmetricModule.cryptoModule.signatureAlgorithm.uri);
+    
     /* For prependHeadersAsym, we need to pass the total length including headers.
      * But at this point, headers haven't been encoded yet, so we pass payload_length + sigsize.
      * prependHeadersAsym will calculate the encryptedLength based on this. */
