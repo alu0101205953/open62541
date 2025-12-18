@@ -1760,12 +1760,20 @@ initSecurityPolicy(UA_Client *client) {
      * in client->config.securityPolicies for PQC-only clients. */
     static const UA_String nonePolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
     
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                "initSecurityPolicy: endpoint.securityPolicyUri.length=%zu, "
-                "endpoint.securityPolicyUri=%S, channel.securityPolicy=%p",
-                client->endpoint.securityPolicyUri.length,
-                client->endpoint.securityPolicyUri.length > 0 ? &client->endpoint.securityPolicyUri : &UA_STRING_NULL,
-                (void*)client->channel.securityPolicy);
+    if(client->endpoint.securityPolicyUri.data && client->endpoint.securityPolicyUri.length > 0) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initSecurityPolicy: endpoint.securityPolicyUri.length=%zu, "
+                    "endpoint.securityPolicyUri=%S, channel.securityPolicy=%p",
+                    client->endpoint.securityPolicyUri.length,
+                    client->endpoint.securityPolicyUri,
+                    (void*)client->channel.securityPolicy);
+    } else {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initSecurityPolicy: endpoint.securityPolicyUri.length=%zu, "
+                    "endpoint.securityPolicyUri=(empty), channel.securityPolicy=%p",
+                    client->endpoint.securityPolicyUri.length,
+                    (void*)client->channel.securityPolicy);
+    }
     
     if(client->endpoint.securityPolicyUri.length == 0) {
         /* Reentrancy guard: already initialized with SecurityPolicy#None */
@@ -1826,10 +1834,17 @@ initSecurityPolicy(UA_Client *client) {
 
     /* Unknown SecurityPolicy -- we would never select such an endpoint */
     if(!sp) {
-        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                     "initSecurityPolicy: SecurityPolicy %S not found in client config. "
-                     "Available policies: %zu",
-                     client->endpoint.securityPolicyUri, client->config.securityPoliciesSize);
+        if(client->endpoint.securityPolicyUri.data && client->endpoint.securityPolicyUri.length > 0) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "initSecurityPolicy: SecurityPolicy %S not found in client config. "
+                         "Available policies: %zu",
+                         client->endpoint.securityPolicyUri, client->config.securityPoliciesSize);
+        } else {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "initSecurityPolicy: SecurityPolicy (empty) not found in client config. "
+                         "Available policies: %zu",
+                         client->config.securityPoliciesSize);
+        }
         UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
                      "[BADINTERNALERROR] initSecurityPolicy: Unknown SecurityPolicy. "
                      "channel.state=%d, channel.securityPolicy=%p, "
@@ -1933,9 +1948,15 @@ initSecurityPolicy(UA_Client *client) {
     }
 
     /* Instantiate the SecurityPolicy context with the remote certificate */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                "initSecurityPolicy: Setting SecurityPolicy %S with server certificate (length=%zu)",
-                sp->policyUri, client->endpoint.serverCertificate.length);
+    if(sp->policyUri.data && sp->policyUri.length > 0) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initSecurityPolicy: Setting SecurityPolicy %S with server certificate (length=%zu)",
+                    sp->policyUri, client->endpoint.serverCertificate.length);
+    } else {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initSecurityPolicy: Setting SecurityPolicy (empty) with server certificate (length=%zu)",
+                    client->endpoint.serverCertificate.length);
+    }
     return UA_SecureChannel_setSecurityPolicy(&client->channel, sp,
                                               &client->endpoint.serverCertificate);
 }

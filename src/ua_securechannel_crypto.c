@@ -234,8 +234,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     
     /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
      * Do not include certificates in the header, regardless of channel->securityMode.
-     * This ensures the AsymmetricSecurityHeader matches the payload securityMode. */
-    UA_Boolean isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+     * This ensures the AsymmetricSecurityHeader matches the payload securityMode.
+     * 
+     * Safety check: Ensure sp->policyUri is valid before calling UA_String_equal.
+     * If policyUri.data is NULL or invalid, we cannot be SecurityPolicy#None. */
+    UA_Boolean isNonePolicy = false;
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+    }
     if(!isNonePolicy &&
        (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
         channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)) {
@@ -275,6 +281,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
 void
 hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
               const UA_Byte **buf_end) {
+    /* Safety check: Return early if channel or securityPolicy is NULL.
+     * This restores the invariant: if securityMode != NONE, then securityPolicy != NULL.
+     * Treat NULL securityPolicy identically to UA_MESSAGESECURITYMODE_NONE.
+     * Do not modify buffers on early return to preserve message layout correctness. */
+    if(!channel || !channel->securityPolicy ||
+       channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
+        return;
+    
     /* Set buf_start to the beginning of the payload body */
     *buf_start += UA_SECURECHANNEL_CHANNELHEADER_LENGTH;
     size_t securityHeaderLength = calculateAsymAlgSecurityHeaderLength(channel);
@@ -302,9 +316,6 @@ hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
     size_t securityHeaderLengthWithMargin = securityHeaderLength + margin;
     *buf_start += securityHeaderLengthWithMargin;
     *buf_start += UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
-
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
-        return;
 
     /* Make space for the certificate */
     *buf_end -= sp->asymmetricModule.cryptoModule.signatureAlgorithm.
