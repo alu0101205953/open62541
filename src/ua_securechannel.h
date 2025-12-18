@@ -228,6 +228,10 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel, UA_UInt32 r
                                           const void *content, const UA_DataType *contentType);
 
 UA_StatusCode
+UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel, UA_UInt32 requestId,
+                                         const void *content, const UA_DataType *contentType);
+
+UA_StatusCode
 UA_SecureChannel_sendSymmetricMessage(UA_SecureChannel *channel, UA_UInt32 requestId,
                                       UA_MessageType messageType, void *payload,
                                       const UA_DataType *payloadType);

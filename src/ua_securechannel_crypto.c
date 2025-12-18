@@ -158,12 +158,30 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     const UA_SecurityPolicy *sp = channel->securityPolicy;
     UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
 
+    /* For SecurityPolicy#None, OPN MUST be sent completely unsecured per OPC UA Part 6.
+     * This function MUST NOT be called for SecurityPolicy#None - it's a logic bug.
+     * SecurityPolicy#None OPN must use UA_SecureChannel_sendUnsecuredOPNMessage instead. */
+    UA_Boolean isNonePolicy = false;
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+    }
+    
+    if(isNonePolicy) {
+        UA_LOG_ERROR(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] prependHeadersAsym called with SecurityPolicy#None. "
+                     "This is a logic bug - SecurityPolicy#None OPN must use sendUnsecuredOPNMessage "
+                     "and bypass prependHeadersAsym entirely. channel.state=%d, requestId=%u",
+                     (int)channel->state, requestId);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
     UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
-                "[TRACE-OPN] prependHeadersAsym: policyUri=%S securityMode=%d totalLen=%zu secHdrLen=%zu requestId=%u",
-                sp->policyUri, (int)channel->securityMode, totalLength,
+                "[TRACE-OPN] prependHeadersAsym: policyUri=%S securityMode=%d isNonePolicy=%d totalLen=%zu secHdrLen=%zu requestId=%u",
+                sp->policyUri, (int)channel->securityMode, (int)isNonePolicy, totalLength,
                 securityHeaderLength, requestId);
 
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
+    /* For SecurityPolicy#None, treat as unsecured OPN regardless of channel->securityMode */
+    if(isNonePolicy || channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
         /* For SecurityPolicy#None there is no encryption/signature, but the
          * message size must still include all headers (TCP + SecureChannel +
          * SequenceHeader) plus the payload. Previously only the payload length
@@ -235,13 +253,7 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
      * Do not include certificates in the header, regardless of channel->securityMode.
      * This ensures the AsymmetricSecurityHeader matches the payload securityMode.
-     * 
-     * Safety check: Ensure sp->policyUri is valid before calling UA_String_equal.
-     * If policyUri.data is NULL or invalid, we cannot be SecurityPolicy#None. */
-    UA_Boolean isNonePolicy = false;
-    if(sp->policyUri.data != NULL && sp->policyUri.length > 0) {
-        isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
-    }
+     * isNonePolicy was already computed above, reuse it here. */
     if(!isNonePolicy &&
        (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
         channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)) {

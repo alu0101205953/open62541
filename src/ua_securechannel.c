@@ -296,6 +296,102 @@ UA_SecureChannel_processHELACK(UA_SecureChannel *channel,
     return UA_STATUSCODE_GOOD;
 }
 
+/* Sends an unsecured OPN message for SecurityPolicy#None.
+ * Per OPC UA Part 6, OPN with SecurityPolicy#None MUST be sent unsecured
+ * (no asymmetric security header, no certificates, no signing, no encryption). */
+UA_StatusCode
+UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
+                                         UA_UInt32 requestId, const void *content,
+                                         const UA_DataType *contentType) {
+    UA_ConnectionManager *cm = channel->connectionManager;
+    if(!UA_SecureChannel_isConnected(channel))
+        return UA_STATUSCODE_BADCONNECTIONCLOSED;
+
+    /* Allocate the message buffer */
+    UA_ByteString buf = UA_BYTESTRING_NULL;
+    UA_StatusCode res = cm->allocNetworkBuffer(cm, channel->connectionId, &buf,
+                                               channel->config.sendBufferSize);
+    UA_CHECK_STATUS(res, return res);
+
+    /* Calculate header sizes first */
+    const UA_SecurityPolicy *sp = channel->securityPolicy;
+    #define UA_SECURECHANNEL_ASYMMETRIC_SECURITYHEADER_FIXED_LENGTH 12
+    size_t securityHeaderLength = UA_SECURECHANNEL_ASYMMETRIC_SECURITYHEADER_FIXED_LENGTH +
+                                  (sp ? sp->policyUri.length : 0);
+    size_t headerSpace = UA_SECURECHANNEL_CHANNELHEADER_LENGTH +
+                         securityHeaderLength +
+                         UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
+
+    /* Reserve space for headers at the beginning, encode payload after headers */
+    UA_Byte *buf_pos = &buf.data[headerSpace];
+    const UA_Byte *buf_end = &buf.data[buf.length];
+    const UA_Byte *payload_start = buf_pos;
+
+    /* Encode the message type and content */
+    UA_EncodeBinaryOptions encOpts;
+    memset(&encOpts, 0, sizeof(UA_EncodeBinaryOptions));
+    encOpts.namespaceMapping = channel->namespaceMapping;
+    res |= UA_NodeId_encodeBinary(&contentType->binaryEncodingId, &buf_pos, buf_end);
+    const UA_Byte *buf_end_ptr = buf_end;
+    res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end_ptr,
+                                   &encOpts, NULL, NULL);
+    UA_CHECK_STATUS(res, goto error);
+
+    /* Calculate payload length */
+    size_t payload_length = (uintptr_t)buf_pos - (uintptr_t)payload_start;
+    size_t total_length = headerSpace + payload_length;
+
+    /* Encode headers at the beginning of the buffer */
+    UA_Byte *header_pos = buf.data;
+    const UA_Byte *buf_end_for_header = payload_start;
+
+    /* Encode TCP MessageHeader */
+    UA_TcpMessageHeader messageHeader;
+    messageHeader.messageTypeAndChunkType = UA_MESSAGETYPE_OPN + UA_CHUNKTYPE_FINAL;
+    messageHeader.messageSize = (UA_UInt32)total_length;
+    res |= UA_encodeBinaryInternal(&messageHeader, &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER],
+                                   &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    UA_CHECK_STATUS(res, goto error);
+
+    /* Encode SecureChannelId (0 for initial OPN) */
+    UA_UInt32 secureChannelId = channel->securityToken.channelId;
+    res |= UA_UInt32_encodeBinary(&secureChannelId, &header_pos, &buf_end_for_header);
+    UA_CHECK_STATUS(res, goto error);
+
+    /* Encode AsymmetricSecurityHeader (SecurityPolicy#None: policyUri only, NO certificates) */
+    UA_AsymmetricAlgorithmSecurityHeader asymHeader;
+    UA_AsymmetricAlgorithmSecurityHeader_init(&asymHeader);
+    if(sp) {
+        asymHeader.securityPolicyUri = sp->policyUri;
+    }
+    /* For SecurityPolicy#None, senderCertificate and receiverCertificateThumbprint are NOT included */
+    res |= UA_encodeBinaryInternal(&asymHeader, &UA_TRANSPORT[UA_TRANSPORT_ASYMMETRICALGORITHMSECURITYHEADER],
+                                   &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    /* Do NOT call UA_AsymmetricAlgorithmSecurityHeader_clear here.
+     * asymHeader.securityPolicyUri is a shallow copy of sp->policyUri, which belongs to
+     * the SecurityPolicy, not to asymHeader. Calling clear would attempt to free memory
+     * that doesn't belong to asymHeader, causing a double-free or free of unallocated memory.
+     * This matches the pattern in prependHeadersAsym, which also doesn't call clear. */
+    UA_CHECK_STATUS(res, goto error);
+
+    /* Encode SequenceHeader */
+    UA_SequenceHeader seqHeader;
+    seqHeader.requestId = requestId;
+    seqHeader.sequenceNumber = 0; /* OPN messages always have sequenceNumber = 0 */
+    res |= UA_encodeBinaryInternal(&seqHeader, &UA_TRANSPORT[UA_TRANSPORT_SEQUENCEHEADER],
+                                   &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    UA_CHECK_STATUS(res, goto error);
+
+    /* Set final buffer length and send */
+    buf.length = total_length;
+    res = cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
+    return res;
+
+error:
+    cm->freeNetworkBuffer(cm, channel->connectionId, &buf);
+    return res;
+}
+
 /* Sends an OPN message using asymmetric encryption if defined */
 UA_StatusCode
 UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
@@ -322,11 +418,42 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
         return UA_STATUSCODE_BADINTERNALERROR;
     }
 
+    /* For SecurityPolicy#None, OPN MUST be sent unsecured per OPC UA Part 6.
+     * This function MUST NOT be called for SecurityPolicy#None - it's a logic bug. */
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0 &&
+       UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
+        UA_LOG_ERROR(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] UA_SecureChannel_sendAsymmetricOPNMessage called with SecurityPolicy#None. "
+                     "This is a logic bug - SecurityPolicy#None OPN must use sendUnsecuredOPNMessage. "
+                     "channel.state=%d, requestId=%u",
+                     (int)channel->state, requestId);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    /* Enforce OPC UA invariant: SecurityPolicy#None => MessageSecurityMode MUST be NONE.
+     * During discovery/initial OPN, channel->securityMode may be stale (e.g. SIGN) while
+     * SecurityPolicy == None. Temporarily force securityMode = NONE for header construction,
+     * then restore the original value before returning. */
+    UA_MessageSecurityMode originalSecurityMode = channel->securityMode;
+    UA_Boolean forcedSecurityMode = false;
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0 &&
+       UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
+        if(channel->securityMode != UA_MESSAGESECURITYMODE_NONE) {
+            channel->securityMode = UA_MESSAGESECURITYMODE_NONE;
+            forcedSecurityMode = true;
+        }
+    }
+
     /* Allocate the message buffer */
     UA_ByteString buf = UA_BYTESTRING_NULL;
     UA_StatusCode res = cm->allocNetworkBuffer(cm, channel->connectionId, &buf,
                                                channel->config.sendBufferSize);
-    UA_CHECK_STATUS(res, return res);
+    UA_CHECK_STATUS(res, {
+        /* Restore original securityMode before returning */
+        if(forcedSecurityMode)
+            channel->securityMode = originalSecurityMode;
+        return res;
+    });
 
     /* Restrict buffer to the available space for the payload */
     UA_Byte *buf_pos = buf.data;
@@ -558,14 +685,35 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     }
     UA_CHECK_STATUS(res, goto error);
 
+    /* For SecurityPolicy#None, OPN MUST be sent completely unsecured per OPC UA Part 6.
+     * Treat SecurityPolicy#None as authoritative and override any stale channel->securityMode. */
+    UA_Boolean isNonePolicy = false;
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+    }
+    
+    /* Defensive validation: If SecurityPolicy == None but securityMode != NONE, correct it */
+    if(isNonePolicy && channel->securityMode != UA_MESSAGESECURITYMODE_NONE) {
+        UA_LOG_WARNING(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "[TRACE-OPN] SecurityPolicy#None detected but channel->securityMode=%d. "
+                       "Forcing securityMode=NONE for unsecured OPN.",
+                       (int)channel->securityMode);
+        if(!forcedSecurityMode) {
+            originalSecurityMode = channel->securityMode;
+            forcedSecurityMode = true;
+        }
+        channel->securityMode = UA_MESSAGESECURITYMODE_NONE;
+    }
+
     /* Compute the header length */
     securityHeaderLength = calculateAsymAlgSecurityHeaderLength(channel);
 
     /* Add padding to the chunk. Also pad if the securityMode is SIGN_ONLY,
      * since we are using asymmetric communication to exchange keys and thus
-     * need to encrypt. */
-    if((channel->securityMode != UA_MESSAGESECURITYMODE_NONE)
-    && !isEccPolicy(channel->securityPolicy))
+     * need to encrypt. For SecurityPolicy#None, NO padding is applied. */
+    if(!isNonePolicy &&
+       (channel->securityMode != UA_MESSAGESECURITYMODE_NONE)
+       && !isEccPolicy(channel->securityPolicy))
         padChunk(channel, &channel->securityPolicy->asymmetricModule.cryptoModule,
                  &buf.data[UA_SECURECHANNEL_CHANNELHEADER_LENGTH + securityHeaderLength],
                  &buf_pos);
@@ -573,8 +721,10 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     /* Calculate payload length (before headers are prepended) */
     size_t payload_length = (uintptr_t)buf_pos - (uintptr_t)payload_start;
     size_t sigsize = 0;
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
-       channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)
+    /* For SecurityPolicy#None, NO signature is calculated (unsecured OPN) */
+    if(!isNonePolicy &&
+       (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
+        channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT))
         sigsize = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             getLocalSignatureSize(channel->channelContext);
     
@@ -595,6 +745,15 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
      * prependHeadersAsym will calculate the encryptedLength based on this. */
     total_length = payload_length + sigsize;
     
+    UA_LOG_WARNING(channel->securityPolicy->logger, UA_LOGCATEGORY_SECURITY,
+        "DEBUG SECSTATE: channel->securityPolicy=%.*s channel->securityMode=%d "
+        "payload.securityMode=%d channel->state=%d",
+        (int)channel->securityPolicy->policyUri.length,
+        channel->securityPolicy->policyUri.data,
+        channel->securityMode,
+        (int)payloadSecurityMode,
+        channel->state);
+
     /* For prependHeadersAsym, we need to pass the end of the full buffer, not the restricted one.
      * The headers will be written at the beginning, and the payload starts at payload_start.
      * The available space for headers is from buf.data to payload_start. */
@@ -615,22 +774,29 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
      * = (payload_start - buf.data) + payload_length + sigsize */
     total_length = pre_sig_length + sigsize;
 
-    /* Log header/message size before sign/encrypt */
+    /* For SecurityPolicy#None, OPN MUST be sent completely unsecured (no signing/encryption).
+     * Skip signAndEncryptAsym for unsecured OPN. */
     UA_TcpMessageHeader tmpHdr;
     size_t tmpOff = 0;
-    UA_decodeBinaryInternal(&buf, &tmpOff, &tmpHdr,
-                            &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
-    size_t bytesUsedBeforeSign = (uintptr_t)buf_pos - (uintptr_t)buf.data;
-    UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
-                "[TRACE-OPN] pre-sign: messageSize=%u bytesUsed=%zu payloadLen=%zu header+seq=%zu",
-                tmpHdr.messageSize, bytesUsedBeforeSign, payload_length,
-                (size_t)(payload_start - buf.data) + UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH);
+    if(!isNonePolicy) {
+        /* Log header/message size before sign/encrypt */
+        UA_decodeBinaryInternal(&buf, &tmpOff, &tmpHdr,
+                                &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
+        size_t bytesUsedBeforeSign = (uintptr_t)buf_pos - (uintptr_t)buf.data;
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] pre-sign: messageSize=%u bytesUsed=%zu payloadLen=%zu header+seq=%zu",
+                    tmpHdr.messageSize, bytesUsedBeforeSign, payload_length,
+                    (size_t)(payload_start - buf.data) + UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH);
 
-    res = signAndEncryptAsym(channel, pre_sig_length, &buf,
-                             securityHeaderLength, total_length, payload_start);
-    UA_CHECK_STATUS(res, goto error);
+        res = signAndEncryptAsym(channel, pre_sig_length, &buf,
+                                 securityHeaderLength, total_length, payload_start);
+        UA_CHECK_STATUS(res, goto error);
+    } else {
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] SecurityPolicy#None: Skipping signAndEncryptAsym for unsecured OPN");
+    }
 
-    /* After sign/encrypt: adjust send length to the messageSize from header */
+    /* After sign/encrypt (or skip for None): adjust send length to the messageSize from header */
     size_t finalLen = buf.length;
     tmpOff = 0;
     UA_decodeBinaryInternal(&buf, &tmpOff, &tmpHdr,
@@ -644,6 +810,13 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     if(UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
         headerSecurityMode = UA_MESSAGESECURITYMODE_NONE;
     }
+    /* Log before sending: policyUri, originalSecurityMode, forcedSecurityMode, payloadSecurityMode */
+    UA_LOG_TRACE(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                 "[TRACE-OPN] pre-send: policyUri=%S originalSecurityMode=%d forcedSecurityMode=%d "
+                 "payloadSecurityMode=%d messageSize=%u sendLen=%zu",
+                 sp->policyUri, (int)originalSecurityMode, (int)forcedSecurityMode,
+                 (int)payloadSecurityMode, tmpHdr.messageSize, buf.length);
+    
     UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                 "[TRACE-OPN] pre-send: messageSize=%u finalLen=%zu sendLen=%zu payloadSecurityMode=%d headerSecurityMode=%d",
                 tmpHdr.messageSize, finalLen, buf.length, (int)payloadSecurityMode, (int)headerSecurityMode);
@@ -677,9 +850,17 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
         buf.length = encryptedLength;
     }
     res = cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
+    
+    /* Restore original securityMode before returning */
+    if(forcedSecurityMode)
+        channel->securityMode = originalSecurityMode;
+    
     return res;
 
 error:
+    /* Restore original securityMode before returning on error */
+    if(forcedSecurityMode)
+        channel->securityMode = originalSecurityMode;
     cm->freeNetworkBuffer(cm, channel->connectionId, &buf);
     return res;
 }

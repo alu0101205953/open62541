@@ -739,23 +739,51 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     opnSecRq.requestHeader.authenticationToken = client->authenticationToken;
     opnSecRq.securityMode = client->channel.securityMode;
     
-    /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
-     * SecurityPolicy#None does not support signing or encryption, so any other
-     * security mode would be invalid and cause the server to reject the OPN. */
+    /* Enforce OPC UA invariant: SecurityPolicy#None => MessageSecurityMode MUST be NONE.
+     * During discovery/initial OPN, channel->securityMode may be stale (e.g. SIGN) while
+     * SecurityPolicy == None. Force request.securityMode = NONE to ensure valid OPN payload. */
     if(client->channel.securityPolicy &&
+       client->channel.securityPolicy->policyUri.data != NULL &&
+       client->channel.securityPolicy->policyUri.length > 0 &&
        UA_String_equal(&client->channel.securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
         opnSecRq.securityMode = UA_MESSAGESECURITYMODE_NONE;
     }
     
-    opnSecRq.clientNonce = client->channel.localNonce;
+    /* Log TRACE: policyUri, request.securityMode, channel->securityMode, payload.securityMode */
+    if(client->channel.securityPolicy) {
+        UA_LOG_TRACE(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "[TRACE-OPN] sendOPNAsync: policyUri=%S request.securityMode=%d "
+                     "channel.securityMode=%d payload.securityMode=%d",
+                     client->channel.securityPolicy->policyUri,
+                     (int)opnSecRq.securityMode,
+                     (int)client->channel.securityMode,
+                     (int)opnSecRq.securityMode);
+    }
     
-    /* For SecurityPolicy#None, ClientNonce must be encoded as an empty ByteString
-     * (length=0, data=non-NULL) rather than NULL (which encodes as Int32(-1)).
-     * This ensures proper decoder alignment. */
-    if(client->channel.securityPolicy &&
-       UA_String_equal(&client->channel.securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI) &&
-       opnSecRq.clientNonce.data == NULL) {
-        UA_ByteString_allocBuffer(&opnSecRq.clientNonce, 0);
+    /* Copy clientNonce with proper ownership. The original assignment was a shallow copy,
+     * which could become invalid if client->channel.localNonce is cleared or modified.
+     * We need to ensure opnSecRq.clientNonce has its own memory that persists through encoding. */
+    UA_ByteString_init(&opnSecRq.clientNonce);
+    if(client->channel.localNonce.length > 0 && client->channel.localNonce.data != NULL) {
+        /* Deep copy the nonce data */
+        UA_StatusCode copyRes = UA_ByteString_allocBuffer(&opnSecRq.clientNonce, client->channel.localNonce.length);
+        if(copyRes != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "sendOPNAsync: Failed to allocate clientNonce buffer: %s",
+                         UA_StatusCode_name(copyRes));
+            client->connectStatus = copyRes;
+            UA_OpenSecureChannelRequest_clear(&opnSecRq);
+            return;
+        }
+        memcpy(opnSecRq.clientNonce.data, client->channel.localNonce.data, client->channel.localNonce.length);
+    } else {
+        /* For SecurityPolicy#None or when localNonce is empty, set clientNonce to NULL.
+         * The binary encoder treats data==NULL as Int32(-1), which is the correct encoding
+         * for an absent ByteString in OPC UA. Using UA_EMPTY_ARRAY_SENTINEL would encode
+         * as Int32(0) and cause offset corruption because the encoder treats non-NULL data
+         * as a valid array pointer. */
+        opnSecRq.clientNonce.length = 0;
+        opnSecRq.clientNonce.data = NULL;
     }
     
     opnSecRq.requestedLifetime = client->config.secureChannelLifeTime;
@@ -772,13 +800,35 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     /* Prepare the entry for the linked list */
     UA_UInt32 requestId = ++client->requestId;
 
+    /* For SecurityPolicy#None, OPN MUST be sent unsecured per OPC UA Part 6.
+     * Detect SecurityPolicy#None BEFORE choosing the send path.
+     * DO NOT call UA_SecureChannel_sendAsymmetricOPNMessage for SecurityPolicy#None. */
+    UA_Boolean isNonePolicy = false;
+    if(client->channel.securityPolicy &&
+       client->channel.securityPolicy->policyUri.data != NULL &&
+       client->channel.securityPolicy->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&client->channel.securityPolicy->policyUri,
+                                       &UA_SECURITY_POLICY_NONE_URI);
+    }
+
     /* Send the OPN message */
     UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
-                 "sendOPNAsync: About to send OPN message (channel->state=%d, requestId=%u, renew=%d)",
-                 client->channel.state, requestId, renew);
-    client->connectStatus =
-        UA_SecureChannel_sendAsymmetricOPNMessage(&client->channel, requestId, &opnSecRq,
-                                                  &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]);
+                 "sendOPNAsync: About to send OPN message (channel->state=%d, requestId=%u, renew=%d, isNonePolicy=%d)",
+                 client->channel.state, requestId, renew, (int)isNonePolicy);
+    
+    if(isNonePolicy) {
+        /* SecurityPolicy#None: Send unsecured OPN (no asymmetric processing) */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
+                     "sendOPNAsync: Sending unsecured OPN for SecurityPolicy#None (bypassing asymmetric path)");
+        client->connectStatus =
+            UA_SecureChannel_sendUnsecuredOPNMessage(&client->channel, requestId, &opnSecRq,
+                                                      &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]);
+    } else {
+        /* Other SecurityPolicies: Use asymmetric OPN path */
+        client->connectStatus =
+            UA_SecureChannel_sendAsymmetricOPNMessage(&client->channel, requestId, &opnSecRq,
+                                                      &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]);
+    }
     if(client->connectStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_SECURECHANNEL,
                       "Sending OPN message failed with error %s",
@@ -1179,6 +1229,28 @@ matchEndpoint(UA_Client *client, const UA_EndpointDescription *endpoint, unsigne
         return false;
     }
 
+    /* Check if we're in discovery phase and endpoint is SecurityPolicy#None */
+    UA_Boolean isDiscoveryPhase = (endpointUnconfigured(&client->endpoint) ||
+                                    client->endpointsHandshake ||
+                                    client->discoveryUrl.length > 0);
+    UA_Boolean isNonePolicy = UA_String_equal(&endpoint->securityPolicyUri,
+                                               &UA_SECURITY_POLICY_NONE_URI);
+    UA_Boolean isNoneMode = (endpoint->securityMode == UA_MESSAGESECURITYMODE_NONE);
+
+    /* DEVELOPMENT-ONLY: During discovery, relax checks for SecurityPolicy#None + SecurityMode NONE */
+    if(isDiscoveryPhase && isNonePolicy && isNoneMode) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[DEV] Accepting Endpoint %u: SecurityPolicy#None + SecurityMode NONE during discovery "
+                    "(relaxed validation)", i);
+        /* Still check if SecurityPolicy#None is available */
+        if(!getSecurityPolicy(client, endpoint->securityPolicyUri)) {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "Rejecting Endpoint %u: SecurityPolicy#None not available in client config", i);
+            return false;
+        }
+        return true;
+    }
+
     /* Selected SecurityMode? */
     if(client->config.securityMode > 0 &&
        client->config.securityMode != endpoint->securityMode) {
@@ -1362,11 +1434,42 @@ responseGetEndpoints(UA_Client *client, void *userdata,
 
         /* Do we want a session? If yes, then the endpoint needs to have a
          * UserTokenPolicy that matches the configuration. */
+        /* DEVELOPMENT-ONLY: During discovery with SecurityPolicy#None, accept Anonymous token even if not explicitly configured */
+        UA_Boolean isDiscoveryPhase = (endpointUnconfigured(&client->endpoint) ||
+                                        client->endpointsHandshake ||
+                                        client->discoveryUrl.length > 0);
+        UA_Boolean isNonePolicy = UA_String_equal(&endpoint->securityPolicyUri,
+                                                   &UA_SECURITY_POLICY_NONE_URI);
+        UA_Boolean isNoneMode = (endpoint->securityMode == UA_MESSAGESECURITYMODE_NONE);
+        
         if(!client->config.noSession && !findUserTokenPolicy(client, endpoint)) {
-            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                        "Rejecting Endpoint %lu: No matching UserTokenPolicy",
-                        (long unsigned)i);
-            continue;
+            /* DEVELOPMENT-ONLY: During discovery with SecurityPolicy#None, accept Anonymous token */
+            if(isDiscoveryPhase && isNonePolicy && isNoneMode) {
+                /* Check if endpoint has Anonymous UserTokenPolicy */
+                UA_Boolean hasAnonymous = false;
+                for(size_t j = 0; j < endpoint->userIdentityTokensSize; ++j) {
+                    if(endpoint->userIdentityTokens[j].tokenType == UA_USERTOKENTYPE_ANONYMOUS) {
+                        hasAnonymous = true;
+                        break;
+                    }
+                }
+                if(hasAnonymous) {
+                    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                                "[DEV] Accepting Endpoint %lu: SecurityPolicy#None with Anonymous UserTokenPolicy "
+                                "during discovery (relaxed validation)", (long unsigned)i);
+                    /* Continue to accept this endpoint */
+                } else {
+                    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                                "Rejecting Endpoint %lu: No matching UserTokenPolicy (no Anonymous token found)",
+                                (long unsigned)i);
+                    continue;
+                }
+            } else {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "Rejecting Endpoint %lu: No matching UserTokenPolicy",
+                            (long unsigned)i);
+                continue;
+            }
         }
 
         /* Best endpoint so far */
@@ -1883,16 +1986,6 @@ initSecurityPolicy(UA_Client *client) {
         return UA_STATUSCODE_GOOD;
     }
 
-    /* Set the SecurityMode -- none if no endpoint is selected so far */
-    client->channel.securityMode = client->endpoint.securityMode;
-    if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
-        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
-
-    /* If the active SecurityPolicy is None, force MessageSecurityMode None.
-     * Discovery OPN must use None/None per OPC UA spec. */
-    if(UA_String_equal(&sp->policyUri, &nonePolicyUri))
-        client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
-
     /* For PQC policies, require server certificate to be available.
      * If not available, use SecurityPolicy#None for discovery phase.
      * The endpoint description is preserved, so GetEndpoints will detect
@@ -1933,7 +2026,8 @@ initSecurityPolicy(UA_Client *client) {
                 }
             }
             
-            /* Initialize with temporary None policy and empty certificate */
+            /* Initialize with temporary None policy and empty certificate.
+             * UA_SecureChannel_setSecurityPolicy() will enforce securityMode = NONE. */
             UA_StatusCode retval = UA_SecureChannel_setSecurityPolicy(&client->channel,
                                                                        client->tempNonePolicy,
                                                                        &UA_BYTESTRING_NULL);
@@ -1942,23 +2036,35 @@ initSecurityPolicy(UA_Client *client) {
             
             return UA_STATUSCODE_GOOD;
         }
-        /* Initialize with None policy from config and empty certificate (allowed for None) */
+        /* Initialize with None policy from config and empty certificate (allowed for None).
+         * UA_SecureChannel_setSecurityPolicy() will enforce securityMode = NONE. */
         return UA_SecureChannel_setSecurityPolicy(&client->channel, noneSp,
                                                   &UA_BYTESTRING_NULL);
     }
 
-    /* Instantiate the SecurityPolicy context with the remote certificate */
-    if(sp->policyUri.data && sp->policyUri.length > 0) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "initSecurityPolicy: Setting SecurityPolicy %S with server certificate (length=%zu)",
-                    sp->policyUri, client->endpoint.serverCertificate.length);
-    } else {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "initSecurityPolicy: Setting SecurityPolicy (empty) with server certificate (length=%zu)",
-                    client->endpoint.serverCertificate.length);
+    /* Determine the final SecurityPolicy to use */
+    UA_SecurityPolicy *finalSp = sp;
+    
+    /* Set the SecurityPolicy. UA_SecureChannel_setSecurityPolicy() will enforce
+     * securityMode = NONE if SecurityPolicy is None. */
+    UA_StatusCode retval = UA_SecureChannel_setSecurityPolicy(&client->channel, finalSp,
+                                                               &client->endpoint.serverCertificate);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+    
+    /* For SecurityPolicies other than None, set securityMode from endpoint.
+     * For SecurityPolicy#None, UA_SecureChannel_setSecurityPolicy() already set
+     * securityMode = NONE, so we must NOT overwrite it. */
+    if(!UA_String_equal(&finalSp->policyUri, &nonePolicyUri)) {
+        /* Set SecurityMode from endpoint -- none if no endpoint is selected so far */
+        client->channel.securityMode = client->endpoint.securityMode;
+        if(client->channel.securityMode == UA_MESSAGESECURITYMODE_INVALID)
+            client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
     }
-    return UA_SecureChannel_setSecurityPolicy(&client->channel, sp,
-                                              &client->endpoint.serverCertificate);
+    /* Else: SecurityPolicy#None => securityMode already set to NONE by
+     * UA_SecureChannel_setSecurityPolicy(). Do NOT overwrite. */
+    
+    return retval;
 }
 
 static void

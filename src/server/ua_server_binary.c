@@ -373,11 +373,31 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     }
 
     /* Send the response */
-    retval = UA_SecureChannel_sendAsymmetricOPNMessage(channel, requestId, &openScResponse,
-                                                       &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    /* For SecurityPolicy#None, OPN response MUST be sent unsecured per OPC UA Part 6.
+     * Detect SecurityPolicy#None BEFORE choosing the send path.
+     * DO NOT call UA_SecureChannel_sendAsymmetricOPNMessage for SecurityPolicy#None. */
+    UA_Boolean isNonePolicy = false;
+    if(channel->securityPolicy &&
+       channel->securityPolicy->policyUri.data != NULL &&
+       channel->securityPolicy->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&channel->securityPolicy->policyUri,
+                                        &UA_SECURITY_POLICY_NONE_URI);
+    }
+    
+    if(isNonePolicy) {
+        /* SecurityPolicy#None: Send unsecured OPN response (no asymmetric processing) */
+        UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                             "processOPN: Sending unsecured OPN response for SecurityPolicy#None (bypassing asymmetric path)");
+        retval = UA_SecureChannel_sendUnsecuredOPNMessage(channel, requestId, &openScResponse,
+                                                           &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    } else {
+        /* Other SecurityPolicies: Use asymmetric OPN path */
+        retval = UA_SecureChannel_sendAsymmetricOPNMessage(channel, requestId, &openScResponse,
+                                                           &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    }
     UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
-                         "processOPN: sending OpenSecureChannelResponse retval=%s",
-                         UA_StatusCode_name(retval));
+                         "processOPN: sending OpenSecureChannelResponse retval=%s (isNonePolicy=%d)",
+                         UA_StatusCode_name(retval), (int)isNonePolicy);
     UA_OpenSecureChannelResponse_clear(&openScResponse);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
