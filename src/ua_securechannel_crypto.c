@@ -436,7 +436,7 @@ signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
         
         UA_ByteString dataToSign = {signedLength, signBuffer};
         UA_ByteString signature = {sigsize, buf->data + preSignLength};
-
+        
         UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "[TRACE-OPN] signAndEncryptAsym(PQC): policyUri=%S securityMode=%d signedLen=%zu sigSize=%zu",
                     sp->policyUri, (int)channel->securityMode, signedLength, sigsize);

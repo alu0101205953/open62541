@@ -344,8 +344,218 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     memset(&encOpts, 0, sizeof(UA_EncodeBinaryOptions));
     encOpts.namespaceMapping = channel->namespaceMapping;
     res |= UA_NodeId_encodeBinary(&contentType->binaryEncodingId, &buf_pos, buf_end);
-    res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end,
+    const UA_Byte *buf_end_ptr = buf_end;
+    res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end_ptr,
                                    &encOpts, NULL, NULL);
+    
+    /* Instrumentación: encoding campo por campo para OpenSecureChannelRequest */
+    if(contentType == &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]) {
+        /* Instrumentación: encoding campo por campo para OpenSecureChannelRequest */
+        const UA_OpenSecureChannelRequest *opnReq = (const UA_OpenSecureChannelRequest *)content;
+        size_t offset_before = (size_t)((uintptr_t)buf_pos - (uintptr_t)buf.data);
+        
+        /* Helper para hexdump */
+        char hexBuf[1024];
+        size_t hexLen = 0;
+        #define HEXDUMP_LIMIT 256
+        
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN-ENCODE] === Inicio encoding OpenSecureChannelRequest ===");
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN-ENCODE] offset_inicial=%zu", offset_before);
+        
+        /* Log valores originales antes del encoding */
+        UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN-ENCODE] Valores originales: clientNonce.length=%zu clientNonce.data=%p (NULL=%d) requestedLifetime=%u",
+                    opnReq->clientNonce.length, (void*)opnReq->clientNonce.data,
+                    (opnReq->clientNonce.data == NULL ? 1 : 0), opnReq->requestedLifetime);
+        
+        /* Encoding normal con logs incrementales */
+        UA_Byte *buf_pos_save = buf_pos;
+        const UA_Byte *buf_end_ptr = buf_end;
+        res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end_ptr,
+                                       &encOpts, NULL, NULL);
+        
+        /* Ahora decodificamos campo por campo para instrumentar */
+        if(res == UA_STATUSCODE_GOOD) {
+            UA_ByteString encoded_body = {(size_t)((uintptr_t)buf_pos - (uintptr_t)buf_pos_save), buf_pos_save};
+            
+            /* Decodificar ExtensionObject header (NodeId + encoding + length) */
+            UA_NodeId typeId;
+            UA_Byte encoding;
+            UA_Int32 contentLength;
+            size_t tmp_off = 0;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &typeId, &UA_TYPES[UA_TYPES_NODEID], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &encoding, &UA_TYPES[UA_TYPES_BYTE], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &contentLength, &UA_TYPES[UA_TYPES_INT32], NULL);
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] ExtensionObject header: offset=%zu bytes=%zu typeId=%u encoding=%u length=%d",
+                        tmp_off - (sizeof(UA_NodeId) + 1 + 4), tmp_off, 
+                        typeId.identifier.numeric, encoding, contentLength);
+            
+            /* Hexdump del header */
+            hexLen = 0;
+            for(size_t i = 0; i < tmp_off && i < HEXDUMP_LIMIT && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump header (%zu bytes): %s", tmp_off, hexBuf);
+            UA_NodeId_clear(&typeId);
+            
+            /* Decodificar RequestHeader (ExtensionObject) */
+            size_t reqHdr_off = tmp_off;
+            UA_NodeId reqHdr_typeId;
+            UA_Byte reqHdr_encoding;
+            UA_Int32 reqHdr_length;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &reqHdr_typeId, &UA_TYPES[UA_TYPES_NODEID], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &reqHdr_encoding, &UA_TYPES[UA_TYPES_BYTE], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &reqHdr_length, &UA_TYPES[UA_TYPES_INT32], NULL);
+            size_t reqHdr_bytes = tmp_off - reqHdr_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] RequestHeader ExtensionObject: offset=%zu bytes=%zu typeId=%u encoding=%u length=%d",
+                        reqHdr_off, reqHdr_bytes, reqHdr_typeId.identifier.numeric, reqHdr_encoding, reqHdr_length);
+            
+            /* Decodificar campos del RequestHeader */
+            UA_NodeId authToken;
+            UA_DateTime timestamp;
+            UA_UInt32 requestHandle;
+            UA_UInt32 returnDiagnostics;
+            UA_String auditEntryId;
+            UA_UInt32 timeoutHint;
+            UA_ExtensionObject additionalHeader;
+            
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &authToken, &UA_TYPES[UA_TYPES_NODEID], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &timestamp, &UA_TYPES[UA_TYPES_DATETIME], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &requestHandle, &UA_TYPES[UA_TYPES_UINT32], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &returnDiagnostics, &UA_TYPES[UA_TYPES_UINT32], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &auditEntryId, &UA_TYPES[UA_TYPES_STRING], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &timeoutHint, &UA_TYPES[UA_TYPES_UINT32], NULL);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &additionalHeader, &UA_TYPES[UA_TYPES_EXTENSIONOBJECT], NULL);
+            
+            size_t reqHdr_content_bytes = tmp_off - (reqHdr_off + 7); /* 7 = NodeId(2) + encoding(1) + length(4) */
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] RequestHeader content: offset=%zu bytes=%zu",
+                        reqHdr_off + 7, reqHdr_content_bytes);
+            
+            /* Hexdump RequestHeader completo */
+            hexLen = 0;
+            for(size_t i = reqHdr_off; i < tmp_off && i < HEXDUMP_LIMIT && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump RequestHeader (%zu bytes): %s", tmp_off - reqHdr_off, hexBuf);
+            
+            UA_NodeId_clear(&reqHdr_typeId);
+            UA_NodeId_clear(&authToken);
+            UA_String_clear(&auditEntryId);
+            UA_ExtensionObject_clear(&additionalHeader);
+            
+            /* ClientProtocolVersion (UInt32) */
+            size_t protoVer_off = tmp_off;
+            UA_UInt32 clientProtocolVersion;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &clientProtocolVersion, &UA_TYPES[UA_TYPES_UINT32], NULL);
+            size_t protoVer_bytes = tmp_off - protoVer_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] ClientProtocolVersion: offset=%zu bytes=%zu value=%u",
+                        protoVer_off, protoVer_bytes, clientProtocolVersion);
+            hexLen = 0;
+            for(size_t i = protoVer_off; i < tmp_off && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump ClientProtocolVersion: %s", hexBuf);
+            
+            /* RequestType (Int32) */
+            size_t reqType_off = tmp_off;
+            UA_Int32 requestType;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &requestType, &UA_TYPES[UA_TYPES_INT32], NULL);
+            size_t reqType_bytes = tmp_off - reqType_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] RequestType: offset=%zu bytes=%zu value=%d",
+                        reqType_off, reqType_bytes, requestType);
+            hexLen = 0;
+            for(size_t i = reqType_off; i < tmp_off && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump RequestType: %s", hexBuf);
+            
+            /* SecurityMode (Int32) */
+            size_t secMode_off = tmp_off;
+            UA_Int32 securityMode;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &securityMode, &UA_TYPES[UA_TYPES_INT32], NULL);
+            size_t secMode_bytes = tmp_off - secMode_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] SecurityMode: offset=%zu bytes=%zu value=%d",
+                        secMode_off, secMode_bytes, securityMode);
+            hexLen = 0;
+            for(size_t i = secMode_off; i < tmp_off && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump SecurityMode: %s", hexBuf);
+            
+            /* ClientNonce (ByteString) - CRÍTICO */
+            size_t nonce_off = tmp_off;
+            UA_ByteString clientNonce;
+            UA_ByteString_init(&clientNonce);
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &clientNonce, &UA_TYPES[UA_TYPES_BYTESTRING], NULL);
+            size_t nonce_bytes = tmp_off - nonce_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] ClientNonce: offset=%zu bytes=%zu length=%zu data=%p (NULL=%d)",
+                        nonce_off, nonce_bytes, clientNonce.length, 
+                        (void*)clientNonce.data, (clientNonce.data == NULL ? 1 : 0));
+            hexLen = 0;
+            for(size_t i = nonce_off; i < tmp_off && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump ClientNonce (%zu bytes): %s", nonce_bytes, hexBuf);
+            UA_ByteString_clear(&clientNonce);
+            
+            /* RequestedLifetime (UInt32) - CRÍTICO */
+            size_t lifetime_off = tmp_off;
+            UA_UInt32 requestedLifetime;
+            UA_decodeBinaryInternal(&encoded_body, &tmp_off, &requestedLifetime, &UA_TYPES[UA_TYPES_UINT32], NULL);
+            size_t lifetime_bytes = tmp_off - lifetime_off;
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] RequestedLifetime: offset=%zu bytes=%zu value=%u",
+                        lifetime_off, lifetime_bytes, requestedLifetime);
+            /* Hexdump de los 4 bytes exactos */
+            hexLen = 0;
+            for(size_t i = lifetime_off; i < tmp_off && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump RequestedLifetime (4 bytes exactos): %s", hexBuf);
+            
+            /* Hexdump completo del body */
+            size_t total_body_bytes = tmp_off;
+            hexLen = 0;
+            for(size_t i = 0; i < total_body_bytes && i < HEXDUMP_LIMIT && hexLen < sizeof(hexBuf) - 4; i++) {
+                int n = snprintf(hexBuf + hexLen, sizeof(hexBuf) - hexLen, "%02X ", encoded_body.data[i]);
+                if(n > 0) hexLen += n;
+            }
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] hexdump body completo (%zu bytes): %s", total_body_bytes, hexBuf);
+            
+            UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-OPN-ENCODE] === Fin encoding OpenSecureChannelRequest: total_bytes=%zu ===",
+                        total_body_bytes);
+        }
+    } else {
+        /* Encoding normal para otros tipos o OpenSecureChannelRequest con SecurityPolicy != None */
+        const UA_Byte *buf_end_ptr = buf_end;
+        res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end_ptr,
+                                       &encOpts, NULL, NULL);
+    }
     UA_CHECK_STATUS(res, goto error);
 
     /* Compute the header length */

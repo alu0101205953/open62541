@@ -739,6 +739,16 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     opnSecRq.requestHeader.authenticationToken = client->authenticationToken;
     opnSecRq.securityMode = client->channel.securityMode;
     opnSecRq.clientNonce = client->channel.localNonce;
+    
+    /* For SecurityPolicy#None, ClientNonce must be encoded as an empty ByteString
+     * (length=0, data=non-NULL) rather than NULL (which encodes as Int32(-1)).
+     * This ensures proper decoder alignment. */
+    if(client->channel.securityPolicy &&
+       UA_String_equal(&client->channel.securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI) &&
+       opnSecRq.clientNonce.data == NULL) {
+        UA_ByteString_allocBuffer(&opnSecRq.clientNonce, 0);
+    }
+    
     opnSecRq.requestedLifetime = client->config.secureChannelLifeTime;
     if(renew) {
         opnSecRq.requestType = UA_SECURITYTOKENREQUESTTYPE_RENEW;
