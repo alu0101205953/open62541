@@ -578,6 +578,13 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
         sigsize = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             getLocalSignatureSize(channel->channelContext);
     
+    /* Extract securityMode from payload for logging (if OpenSecureChannelRequest) */
+    UA_MessageSecurityMode payloadSecurityMode = channel->securityMode;
+    if(contentType == &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST]) {
+        const UA_OpenSecureChannelRequest *opnReq = (const UA_OpenSecureChannelRequest *)content;
+        payloadSecurityMode = opnReq->securityMode;
+    }
+    
     UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                 "[TRACE-OPN] UA_SecureChannel_sendAsymmetricOPNMessage: policyUri=%S securityMode=%d payloadLen=%zu sigSize=%zu sigAlg=%S",
                 sp->policyUri, (int)channel->securityMode, payload_length, sigsize,
@@ -630,9 +637,16 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
                             &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER], NULL);
     if(tmpHdr.messageSize <= buf.length)
         buf.length = tmpHdr.messageSize;
+    /* Log payload and header securityMode before sending.
+     * For SecurityPolicy#None, header implicitly uses NONE (no certificates).
+     * For other policies, header uses channel->securityMode (certificates if SIGN/SIGNANDENCRYPT). */
+    UA_MessageSecurityMode headerSecurityMode = channel->securityMode;
+    if(UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
+        headerSecurityMode = UA_MESSAGESECURITYMODE_NONE;
+    }
     UA_LOG_INFO(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
-                "[TRACE-OPN] pre-send: messageSize=%u finalLen=%zu sendLen=%zu",
-                tmpHdr.messageSize, finalLen, buf.length);
+                "[TRACE-OPN] pre-send: messageSize=%u finalLen=%zu sendLen=%zu payloadSecurityMode=%d headerSecurityMode=%d",
+                tmpHdr.messageSize, finalLen, buf.length, (int)payloadSecurityMode, (int)headerSecurityMode);
     size_t hexLen = finalLen * 3 + 1;
     char *hexBuf = (char*)UA_malloc(hexLen);
     if(hexBuf) {
@@ -665,7 +679,7 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
     res = cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
     return res;
 
- error:
+error:
     cm->freeNetworkBuffer(cm, channel->connectionId, &buf);
     return res;
 }

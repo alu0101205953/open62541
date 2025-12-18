@@ -231,8 +231,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     UA_AsymmetricAlgorithmSecurityHeader asymHeader;
     UA_AsymmetricAlgorithmSecurityHeader_init(&asymHeader);
     asymHeader.securityPolicyUri = sp->policyUri;
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
-       channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT) {
+    
+    /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
+     * Do not include certificates in the header, regardless of channel->securityMode.
+     * This ensures the AsymmetricSecurityHeader matches the payload securityMode. */
+    UA_Boolean isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+    if(!isNonePolicy &&
+       (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
+        channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)) {
         if(sp->localCertificate.length > 0 && sp->localCertificate.data) {
         asymHeader.senderCertificate = sp->localCertificate;
         } else {

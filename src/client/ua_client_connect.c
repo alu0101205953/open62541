@@ -738,6 +738,15 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
     opnSecRq.requestHeader.timestamp = el->dateTime_now(el);
     opnSecRq.requestHeader.authenticationToken = client->authenticationToken;
     opnSecRq.securityMode = client->channel.securityMode;
+    
+    /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
+     * SecurityPolicy#None does not support signing or encryption, so any other
+     * security mode would be invalid and cause the server to reject the OPN. */
+    if(client->channel.securityPolicy &&
+       UA_String_equal(&client->channel.securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI)) {
+        opnSecRq.securityMode = UA_MESSAGESECURITYMODE_NONE;
+    }
+    
     opnSecRq.clientNonce = client->channel.localNonce;
     
     /* For SecurityPolicy#None, ClientNonce must be encoded as an empty ByteString
@@ -1386,6 +1395,11 @@ responseGetEndpoints(UA_Client *client, void *userdata,
     client->endpoint = resp->endpoints[bestEndpointIndex];
     UA_EndpointDescription_init(&resp->endpoints[bestEndpointIndex]);
     
+    /* Log the selected endpoint's SecurityPolicy for debugging */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "responseGetEndpoints: Selected endpoint SecurityPolicy=%S (length=%zu)",
+                client->endpoint.securityPolicyUri, client->endpoint.securityPolicyUri.length);
+    
     /* If the client has a direct endpoint configured with UserTokenPolicies, use those instead */
     if(!endpointUnconfigured(&client->config.endpoint) &&
        client->config.endpoint.userIdentityTokensSize > 0) {
@@ -1745,6 +1759,14 @@ initSecurityPolicy(UA_Client *client) {
      * In this case, we need SecurityPolicy#None for discovery, but it may not be available
      * in client->config.securityPolicies for PQC-only clients. */
     static const UA_String nonePolicyUri = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
+    
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "initSecurityPolicy: endpoint.securityPolicyUri.length=%zu, "
+                "endpoint.securityPolicyUri=%S, channel.securityPolicy=%p",
+                client->endpoint.securityPolicyUri.length,
+                client->endpoint.securityPolicyUri.length > 0 ? &client->endpoint.securityPolicyUri : &UA_STRING_NULL,
+                (void*)client->channel.securityPolicy);
+    
     if(client->endpoint.securityPolicyUri.length == 0) {
         /* Reentrancy guard: already initialized with SecurityPolicy#None */
         if(client->channel.securityPolicy &&
@@ -1805,6 +1827,10 @@ initSecurityPolicy(UA_Client *client) {
     /* Unknown SecurityPolicy -- we would never select such an endpoint */
     if(!sp) {
         UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                     "initSecurityPolicy: SecurityPolicy %S not found in client config. "
+                     "Available policies: %zu",
+                     client->endpoint.securityPolicyUri, client->config.securityPoliciesSize);
+        UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
                      "[BADINTERNALERROR] initSecurityPolicy: Unknown SecurityPolicy. "
                      "channel.state=%d, channel.securityPolicy=%p, "
                      "endpoint.securityPolicyUri.length=%zu, "
@@ -1860,6 +1886,9 @@ initSecurityPolicy(UA_Client *client) {
     static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
     if(UA_String_equal(&sp->policyUri, &pqcPolicyUri) &&
        client->endpoint.serverCertificate.length == 0) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initSecurityPolicy: PQC policy selected but server certificate not available. "
+                    "Using SecurityPolicy#None for discovery. Endpoint will trigger reconnection after GetEndpoints.");
         /* Use SecurityPolicy#None for discovery instead of PQC */
         UA_SecurityPolicy *noneSp = NULL;
         for(size_t i = 0; i < client->config.securityPoliciesSize; i++) {
@@ -1904,6 +1933,9 @@ initSecurityPolicy(UA_Client *client) {
     }
 
     /* Instantiate the SecurityPolicy context with the remote certificate */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "initSecurityPolicy: Setting SecurityPolicy %S with server certificate (length=%zu)",
+                sp->policyUri, client->endpoint.serverCertificate.length);
     return UA_SecureChannel_setSecurityPolicy(&client->channel, sp,
                                               &client->endpoint.serverCertificate);
 }
@@ -1948,6 +1980,64 @@ connectActivity(UA_Client *client) {
     case UA_SECURECHANNELSTATE_ACK_RECEIVED:
         UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "connectActivity: ACK_RECEIVED state detected, calling sendOPNAsync to send OPN message");
+        
+        /* Ensure SecurityPolicy is initialized before sending OPN.
+         * If endpoint is configured, use its securityPolicyUri. Otherwise, use None for discovery. */
+        if(!endpointUnconfigured(&client->endpoint)) {
+            /* Endpoint is configured - ensure SecurityPolicy matches endpoint's securityPolicyUri */
+            UA_SecurityPolicy *expectedSp = getSecurityPolicy(client, client->endpoint.securityPolicyUri);
+            if(!expectedSp) {
+                UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                             "[BADINTERNALERROR] ACK_RECEIVED: SecurityPolicy %S not found in config",
+                             client->endpoint.securityPolicyUri);
+                client->connectStatus = UA_STATUSCODE_BADINTERNALERROR;
+                return;
+            }
+            
+            /* Initialize SecurityPolicy if not already set or if it doesn't match */
+            if(!client->channel.securityPolicy ||
+               client->channel.securityPolicy != expectedSp) {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "ACK_RECEIVED: Initializing SecurityPolicy %S from selected endpoint",
+                            client->endpoint.securityPolicyUri);
+                client->connectStatus = initSecurityPolicy(client);
+                if(client->connectStatus != UA_STATUSCODE_GOOD)
+                    return;
+            }
+            
+            /* Verify SecurityPolicy matches endpoint */
+            if(client->channel.securityPolicy &&
+               !UA_String_equal(&client->channel.securityPolicy->policyUri,
+                               &client->endpoint.securityPolicyUri)) {
+                UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                             "[BADINTERNALERROR] ACK_RECEIVED: SecurityPolicy mismatch. "
+                             "channel.policyUri=%S, endpoint.policyUri=%S",
+                             client->channel.securityPolicy->policyUri,
+                             client->endpoint.securityPolicyUri);
+                client->connectStatus = UA_STATUSCODE_BADINTERNALERROR;
+                return;
+            }
+            
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "ACK_RECEIVED: Using SecurityPolicy %S for OPN (matches selected endpoint)",
+                        client->channel.securityPolicy->policyUri);
+        } else {
+            /* Endpoint not configured - use None for discovery */
+            if(!client->channel.securityPolicy) {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "ACK_RECEIVED: Endpoint not configured, initializing SecurityPolicy#None for discovery");
+                client->connectStatus = initSecurityPolicy(client);
+                if(client->connectStatus != UA_STATUSCODE_GOOD)
+                    return;
+            }
+            
+            if(client->channel.securityPolicy) {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "ACK_RECEIVED: Using SecurityPolicy %S for discovery OPN",
+                            client->channel.securityPolicy->policyUri);
+            }
+        }
+        
         sendOPNAsync(client, false); /* Send OPN */
         return;
 
@@ -2307,12 +2397,24 @@ initConnect(UA_Client *client) {
         return;
     }
 
-    /* An exact endpoint was configured. Use it. */
-    if(!endpointUnconfigured(&client->config.endpoint)) {
+    /* An exact endpoint was configured. Use it.
+     * However, if we have a preserved endpoint from GetEndpoints (e.g., after
+     * detecting a SecurityPolicy mismatch), use that instead to ensure we use
+     * the server's actual endpoint configuration. */
+    if(!endpointUnconfigured(&client->endpoint)) {
+        /* Endpoint already configured (e.g., preserved from GetEndpoints) - use it */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initConnect: Using preserved endpoint with SecurityPolicy=%S",
+                    client->endpoint.securityPolicyUri);
+    } else if(!endpointUnconfigured(&client->config.endpoint)) {
+        /* Use configured endpoint from client config */
         UA_EndpointDescription_clear(&client->endpoint);
         client->connectStatus =
             UA_EndpointDescription_copy(&client->config.endpoint, &client->endpoint);
         UA_CHECK_STATUS(client->connectStatus, return);
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "initConnect: Using configured endpoint with SecurityPolicy=%S",
+                    client->endpoint.securityPolicyUri);
     }
 
     /* Start the EventLoop if not already started */
