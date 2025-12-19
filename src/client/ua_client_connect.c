@@ -1091,10 +1091,47 @@ activateSessionAsync(UA_Client *client) {
 
     const UA_UserTokenPolicy *utp = findUserTokenPolicy(client, &client->endpoint);
     if(!utp) {
-        UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_NETWORK,
-                       "Could not find a matching UserTokenPolicy in the endpoint");
-        return UA_STATUSCODE_BADINTERNALERROR;
+        /* Search for CERTIFICATE UserTokenPolicy with PQC securityPolicyUri */
+        static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-UTP-CERT] activateSessionAsync: No matching UserTokenPolicy found, "
+                    "searching for CERTIFICATE UserTokenPolicy with PQC securityPolicyUri");
+        
+        for(size_t j = 0; j < client->endpoint.userIdentityTokensSize; ++j) {
+            UA_UserTokenPolicy *tokenPolicy = &client->endpoint.userIdentityTokens[j];
+            
+            if(tokenPolicy->tokenType == UA_USERTOKENTYPE_CERTIFICATE) {
+                UA_String tokenPolicyUri = tokenPolicy->securityPolicyUri;
+                if(UA_String_isEmpty(&tokenPolicyUri))
+                    tokenPolicyUri = client->endpoint.securityPolicyUri;
+                
+                if(UA_String_equal(&tokenPolicyUri, &pqcPolicyUri)) {
+                    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                                "[TRACE-UTP-CERT] activateSessionAsync: Found CERTIFICATE UserTokenPolicy[%zu] - "
+                                "policyId=%S, securityPolicyUri=%S (PQC)",
+                                j, tokenPolicy->policyId, tokenPolicyUri);
+                    utp = tokenPolicy;
+                    break;
+                }
+            }
+        }
+        
+        if(!utp) {
+            UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_NETWORK,
+                           "Could not find a matching UserTokenPolicy in the endpoint");
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
     }
+    
+    /* [TRACE-UTP-CERT] Log selected UserTokenPolicy */
+    UA_String tokenPolicyUri = utp->securityPolicyUri;
+    if(UA_String_isEmpty(&tokenPolicyUri))
+        tokenPolicyUri = client->endpoint.securityPolicyUri;
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-UTP-CERT] activateSessionAsync: Selected UserTokenPolicy - "
+                "tokenType=%d (CERTIFICATE=%d), policyId=%S, securityPolicyUri=%S",
+                (int)utp->tokenType, (int)UA_USERTOKENTYPE_CERTIFICATE,
+                utp->policyId, tokenPolicyUri);
 
     /* Initialize the request */
     UA_ActivateSessionRequest request;
@@ -1111,24 +1148,79 @@ activateSessionAsync(UA_Client *client) {
         request.localeIdsSize = client->config.sessionLocaleIdsSize;
     }
 
-    /* Set the User Identity Token. If not defined use an anonymous token. Use
-     * the PolicyId from the UserTokenPolicy. All token types have the PolicyId
-     * string as the first element. */
-    UA_AnonymousIdentityToken anonToken;
-    retval = UA_ExtensionObject_copy(&client->config.userIdentityToken,
-                                     &request.userIdentityToken);
-    if(request.userIdentityToken.encoding != UA_EXTENSIONOBJECT_ENCODED_NOBODY) {
-        UA_String *policyId = (UA_String*)request.userIdentityToken.content.decoded.data;
-        UA_String_clear(policyId);
-        retval = UA_String_copy(&utp->policyId, policyId);
+    /* Set the User Identity Token. If UserTokenPolicy is CERTIFICATE, use X509IdentityToken
+     * with the client's local certificate. Otherwise use the configured token or Anonymous. */
+    if(utp->tokenType == UA_USERTOKENTYPE_CERTIFICATE) {
+        /* Get the client's local certificate from the SecureChannel's SecurityPolicy */
+        UA_ByteString *clientCert = NULL;
+        if(client->channel.securityPolicy && 
+           client->channel.securityPolicy->localCertificate.length > 0) {
+            clientCert = &client->channel.securityPolicy->localCertificate;
+        } else {
+            /* Try to get from authSecurityPolicies if available */
+            static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+            UA_String tokenPolicyUri = utp->securityPolicyUri;
+            if(UA_String_isEmpty(&tokenPolicyUri))
+                tokenPolicyUri = client->endpoint.securityPolicyUri;
+            
+            UA_SecurityPolicy *authSp = getAuthSecurityPolicy(client, tokenPolicyUri);
+            if(authSp && authSp->localCertificate.length > 0) {
+                clientCert = &authSp->localCertificate;
+            }
+        }
+        
+        if(!clientCert || clientCert->length == 0) {
+            UA_LOG_ERROR(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                         "[TRACE-UTP-CERT] activateSessionAsync: CERTIFICATE UserTokenPolicy selected "
+                         "but client certificate not available");
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+        
+        /* Create X509IdentityToken with client certificate */
+        UA_X509IdentityToken *x509Token = UA_X509IdentityToken_new();
+        if(!x509Token) {
+            return UA_STATUSCODE_BADOUTOFMEMORY;
+        }
+        
+        retval = UA_String_copy(&utp->policyId, &x509Token->policyId);
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_X509IdentityToken_delete(x509Token);
+            return retval;
+        }
+        
+        retval = UA_ByteString_copy(clientCert, &x509Token->certificateData);
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_X509IdentityToken_delete(x509Token);
+            return retval;
+        }
+        
+        UA_ExtensionObject_clear(&request.userIdentityToken);
+        request.userIdentityToken.encoding = UA_EXTENSIONOBJECT_DECODED;
+        request.userIdentityToken.content.decoded.type = &UA_TYPES[UA_TYPES_X509IDENTITYTOKEN];
+        request.userIdentityToken.content.decoded.data = x509Token;
+        
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-UTP-CERT] activateSessionAsync: Created X509IdentityToken - "
+                    "policyId=%S, certificateData.length=%zu",
+                    x509Token->policyId, x509Token->certificateData.length);
     } else {
-        UA_AnonymousIdentityToken_init(&anonToken);
-        UA_ExtensionObject_setValueNoDelete(&request.userIdentityToken, &anonToken,
-                                            &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN]);
-        anonToken.policyId = utp->policyId;
+        /* Use configured token or Anonymous for non-CERTIFICATE UserTokenPolicy */
+        UA_AnonymousIdentityToken anonToken;
+        retval = UA_ExtensionObject_copy(&client->config.userIdentityToken,
+                                         &request.userIdentityToken);
+        if(request.userIdentityToken.encoding != UA_EXTENSIONOBJECT_ENCODED_NOBODY) {
+            UA_String *policyId = (UA_String*)request.userIdentityToken.content.decoded.data;
+            UA_String_clear(policyId);
+            retval = UA_String_copy(&utp->policyId, policyId);
+        } else {
+            UA_AnonymousIdentityToken_init(&anonToken);
+            UA_ExtensionObject_setValueNoDelete(&request.userIdentityToken, &anonToken,
+                                                &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN]);
+            anonToken.policyId = utp->policyId;
+        }
+        if(retval != UA_STATUSCODE_GOOD)
+            return retval;
     }
-    if(retval != UA_STATUSCODE_GOOD)
-        return retval;
 
     UA_SecurityPolicy *utsp = NULL;
     UA_SecureChannel *channel = &client->channel;
@@ -1229,7 +1321,7 @@ matchEndpoint(UA_Client *client, const UA_EndpointDescription *endpoint, unsigne
         return false;
     }
 
-    /* Check if we're in discovery phase and endpoint is SecurityPolicy#None */
+    /* Check if we're in discovery phase */
     UA_Boolean isDiscoveryPhase = (endpointUnconfigured(&client->endpoint) ||
                                     client->endpointsHandshake ||
                                     client->discoveryUrl.length > 0);
@@ -1237,20 +1329,59 @@ matchEndpoint(UA_Client *client, const UA_EndpointDescription *endpoint, unsigne
                                                &UA_SECURITY_POLICY_NONE_URI);
     UA_Boolean isNoneMode = (endpoint->securityMode == UA_MESSAGESECURITYMODE_NONE);
 
-    /* DEVELOPMENT-ONLY: During discovery, relax checks for SecurityPolicy#None + SecurityMode NONE */
-    if(isDiscoveryPhase && isNonePolicy && isNoneMode) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "[DEV] Accepting Endpoint %u: SecurityPolicy#None + SecurityMode NONE during discovery "
-                    "(relaxed validation)", i);
-        /* Still check if SecurityPolicy#None is available */
+    /* During discovery phase (SecurityPolicy#None), relax validation for secure endpoints.
+     * This allows selecting PQC endpoints that will be used after closing the None SecureChannel.
+     * Requirements for secure endpoints during discovery:
+     * - Must have serverCertificate (required for non-None policies)
+     * - SecurityPolicy must be available in client config
+     * - SecurityMode and SecurityPolicy matching are relaxed (will be validated after transition) */
+    if(isDiscoveryPhase && !isNonePolicy && endpoint->serverCertificate.length > 0) {
+        /* SecurityPolicy must be available in client config */
         if(!getSecurityPolicy(client, endpoint->securityPolicyUri)) {
             UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                        "Rejecting Endpoint %u: SecurityPolicy#None not available in client config", i);
+                        "Rejecting Endpoint %u: SecurityPolicy %S not supported (discovery phase)",
+                        i, endpoint->securityPolicyUri);
             return false;
+        }
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "Accepting Endpoint %u: %S + SecurityMode %d during discovery "
+                    "(serverCertificate.length=%zu, will transition after None SecureChannel)",
+                    i, endpoint->securityPolicyUri, (int)endpoint->securityMode,
+                    endpoint->serverCertificate.length);
+        return true;
+    }
+
+    /* DEVELOPMENT/TESTING ONLY: Allow SecurityPolicy#None endpoints when explicitly enabled.
+     * This relaxes checks for SecurityPolicy#None + SecurityMode NONE during discovery
+     * or when allowSecurityPolicyNone is set in client configuration. */
+    if((isDiscoveryPhase || client->config.allowSecurityPolicyNone) && isNonePolicy && isNoneMode) {
+        if(client->config.allowSecurityPolicyNone) {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "[DEV] Accepting Endpoint %u: SecurityPolicy#None + SecurityMode NONE "
+                        "(allowSecurityPolicyNone enabled)", i);
+        } else {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "[DEV] Accepting Endpoint %u: SecurityPolicy#None + SecurityMode NONE during discovery "
+                        "(relaxed validation)", i);
+        }
+        /* Check if SecurityPolicy#None is available, or if allowSecurityPolicyNone is enabled */
+        if(!getSecurityPolicy(client, endpoint->securityPolicyUri)) {
+            if(client->config.allowSecurityPolicyNone) {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "[DEV] SecurityPolicy#None not in config, but allowSecurityPolicyNone enabled. "
+                            "Creating temporary SecurityPolicy#None for endpoint selection.");
+                /* SecurityPolicy#None will be created on-demand in initSecurityPolicy if needed */
+            } else {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "Rejecting Endpoint %u: SecurityPolicy#None not available in client config "
+                            "(set allowSecurityPolicyNone=true to allow)", i);
+                return false;
+            }
         }
         return true;
     }
 
+    /* Secure connection phase: strict validation applies */
     /* Selected SecurityMode? */
     if(client->config.securityMode > 0 &&
        client->config.securityMode != endpoint->securityMode) {
@@ -1324,6 +1455,23 @@ matchUserToken(UA_Client *client,
 static UA_UserTokenPolicy *
 findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
     
+    /* [TRACE-UTP] Log client configuration */
+    const UA_DataType *clientTokenType = client->config.userIdentityToken.content.decoded.type;
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-UTP] findUserTokenPolicy: Client config - "
+                "userIdentityToken.type=%p (%s), authSecurityPolicyUri.length=%zu, "
+                "endpoint.securityPolicyUri=%S",
+                (void*)clientTokenType,
+                clientTokenType ? clientTokenType->typeName : "NULL",
+                client->config.authSecurityPolicyUri.length,
+                endpoint->securityPolicyUri);
+    
+    if(clientTokenType) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-UTP] findUserTokenPolicy: Client token type name=%s",
+                    clientTokenType->typeName);
+    }
+    
     /* Was a UserTokenPolicy configured? Then we need an exact match. */
     UA_UserTokenPolicy *requiredTokenPolicy = NULL;
     UA_UserTokenPolicy tmp;
@@ -1331,26 +1479,45 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
     if(!UA_equal(&tmp, &client->config.userTokenPolicy, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]))
         requiredTokenPolicy = &client->config.userTokenPolicy;
 
+    /* [TRACE-UTP] Log all available UserTokenPolicies in endpoint */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-UTP] findUserTokenPolicy: Endpoint has %zu UserTokenPolicies",
+                endpoint->userIdentityTokensSize);
+    
     for(size_t j = 0; j < endpoint->userIdentityTokensSize; ++j) {
-        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
-                    "findUserTokenPolicy: Checking tokenPolicy[%zu] (tokenType=%d, policyId.length=%zu, securityPolicyUri.length=%zu)",
-                    j, endpoint->userIdentityTokens[j].tokenType,
-                    endpoint->userIdentityTokens[j].policyId.length,
-                    endpoint->userIdentityTokens[j].securityPolicyUri.length);
-        /* Is the SecurityPolicy available? */
         UA_UserTokenPolicy *tokenPolicy = &endpoint->userIdentityTokens[j];
-
+        
         UA_String tokenPolicyUri = tokenPolicy->securityPolicyUri;
         if(UA_String_isEmpty(&tokenPolicyUri))
             tokenPolicyUri = endpoint->securityPolicyUri;
-
-        /* Ignore missing auth security policy for anonymous tokens */
+        
+        /* [TRACE-UTP] Log each UserTokenPolicy */
+        const char *tokenTypeName = "UNKNOWN";
+        switch(tokenPolicy->tokenType) {
+            case UA_USERTOKENTYPE_ANONYMOUS: tokenTypeName = "ANONYMOUS"; break;
+            case UA_USERTOKENTYPE_USERNAME: tokenTypeName = "USERNAME"; break;
+            case UA_USERTOKENTYPE_CERTIFICATE: tokenTypeName = "CERTIFICATE"; break;
+            case UA_USERTOKENTYPE_ISSUEDTOKEN: tokenTypeName = "ISSUEDTOKEN"; break;
+        }
+        
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
+                    "tokenType=%d (%s), policyId=%S, securityPolicyUri=%S",
+                    j, (int)tokenPolicy->tokenType, tokenTypeName,
+                    tokenPolicy->policyId, tokenPolicyUri);
+        
+        /* Is the SecurityPolicy available? */
+        UA_Boolean authPolicyAvailable = true;
         if(client->config.userIdentityToken.content.decoded.type &&
            client->config.userIdentityToken.content.decoded.type !=
                &UA_TYPES[UA_TYPES_ANONYMOUSIDENTITYTOKEN]) {
             const UA_String none = UA_STRING_STATIC("http://opcfoundation.org/UA/SecurityPolicy#None");
             /* activateSessionAsync() handles the None case separately without accessing authSecurityPolicies */
             if(!UA_String_equal(&none, &tokenPolicyUri) && !getAuthSecurityPolicy(client, tokenPolicyUri)) {
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
+                            "REJECTED: authSecurityPolicy %S not available",
+                            j, tokenPolicyUri);
                 continue;
             }
         }
@@ -1358,20 +1525,42 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
         /* Required SecurityPolicyUri in the configuration? */
         if(!UA_String_isEmpty(&client->config.authSecurityPolicyUri) &&
            !UA_String_equal(&client->config.authSecurityPolicyUri,
-                            &tokenPolicyUri))
+                            &tokenPolicyUri)) {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
+                        "REJECTED: securityPolicyUri mismatch (required=%S, found=%S)",
+                        j, client->config.authSecurityPolicyUri, tokenPolicyUri);
             continue;
+        }
 
         /* Match (entire) UserTokenPolicy if defined in the configuration? */
         if(requiredTokenPolicy &&
-           !UA_equal(requiredTokenPolicy, tokenPolicy, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]))
+           !UA_equal(requiredTokenPolicy, tokenPolicy, &UA_TYPES[UA_TYPES_USERTOKENPOLICY])) {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
+                        "REJECTED: does not match required UserTokenPolicy",
+                        j);
             continue;
+        }
 
         /* Match with the configured UserToken */
-        if(!matchUserToken(client, tokenPolicy))
+        UA_Boolean tokenMatches = matchUserToken(client, tokenPolicy);
+        if(!tokenMatches) {
+            UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                        "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
+                        "REJECTED: tokenType mismatch",
+                        j);
             continue;
+        }
+        
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - ACCEPTED",
+                    j);
         return tokenPolicy;
     }
 
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-UTP] findUserTokenPolicy: No matching UserTokenPolicy found");
     return NULL;
 }
 
@@ -1423,6 +1612,14 @@ responseGetEndpoints(UA_Client *client, void *userdata,
     /* Find a matching combination of Endpoint and UserTokenPolicy */
     for(size_t i = 0; i < resp->endpointsSize; ++i) {
         UA_EndpointDescription* endpoint = &resp->endpoints[i];
+        
+        /* [TRACE-CERT] Log serverCertificate in GetEndpointsResponse */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: endpoint[%zu] serverCertificate.length=%zu "
+                    "serverCertificate.data=%p securityPolicyUri=%S",
+                    i, endpoint->serverCertificate.length,
+                    (void*)endpoint->serverCertificate.data,
+                    endpoint->securityPolicyUri);
 
         /* Do we already have a better candidate? */
         if(endpoint->securityLevel < bestEndpointLevel)
@@ -1434,7 +1631,6 @@ responseGetEndpoints(UA_Client *client, void *userdata,
 
         /* Do we want a session? If yes, then the endpoint needs to have a
          * UserTokenPolicy that matches the configuration. */
-        /* DEVELOPMENT-ONLY: During discovery with SecurityPolicy#None, accept Anonymous token even if not explicitly configured */
         UA_Boolean isDiscoveryPhase = (endpointUnconfigured(&client->endpoint) ||
                                         client->endpointsHandshake ||
                                         client->discoveryUrl.length > 0);
@@ -1442,10 +1638,19 @@ responseGetEndpoints(UA_Client *client, void *userdata,
                                                    &UA_SECURITY_POLICY_NONE_URI);
         UA_Boolean isNoneMode = (endpoint->securityMode == UA_MESSAGESECURITYMODE_NONE);
         
+        /* During discovery phase, relax UserTokenPolicy validation for secure endpoints.
+         * The UserTokenPolicy will be validated after transitioning to the secure SecureChannel.
+         * For SecurityPolicy#None endpoints, still require Anonymous token if available. */
         if(!client->config.noSession && !findUserTokenPolicy(client, endpoint)) {
-            /* DEVELOPMENT-ONLY: During discovery with SecurityPolicy#None, accept Anonymous token */
-            if(isDiscoveryPhase && isNonePolicy && isNoneMode) {
-                /* Check if endpoint has Anonymous UserTokenPolicy */
+            if(isDiscoveryPhase && !isNonePolicy && endpoint->serverCertificate.length > 0) {
+                /* Secure endpoint during discovery: skip UserTokenPolicy validation.
+                 * Will be validated after transition to secure SecureChannel. */
+                UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                            "Accepting Endpoint %lu: %S during discovery (UserTokenPolicy validation deferred)",
+                            (long unsigned)i, endpoint->securityPolicyUri);
+                /* Continue to accept this endpoint */
+            } else if(isDiscoveryPhase && isNonePolicy && isNoneMode) {
+                /* SecurityPolicy#None during discovery: require Anonymous token if available */
                 UA_Boolean hasAnonymous = false;
                 for(size_t j = 0; j < endpoint->userIdentityTokensSize; ++j) {
                     if(endpoint->userIdentityTokens[j].tokenType == UA_USERTOKENTYPE_ANONYMOUS) {
@@ -1465,6 +1670,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
                     continue;
                 }
             } else {
+                /* Secure connection phase: strict UserTokenPolicy validation */
                 UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
                             "Rejecting Endpoint %lu: No matching UserTokenPolicy",
                             (long unsigned)i);
@@ -1472,7 +1678,20 @@ responseGetEndpoints(UA_Client *client, void *userdata,
             }
         }
 
-        /* Best endpoint so far */
+        /* Best endpoint so far.
+         * During discovery, prefer secure endpoints (non-None) over None endpoints
+         * to enable transition from None to secure SecureChannel. */
+        if(isDiscoveryPhase && isNonePolicy && bestEndpointIndex != notFound) {
+            /* If we already have a secure endpoint candidate, prefer it over None */
+            UA_EndpointDescription* currentBest = &resp->endpoints[bestEndpointIndex];
+            UA_Boolean currentBestIsNone = UA_String_equal(&currentBest->securityPolicyUri,
+                                                           &UA_SECURITY_POLICY_NONE_URI);
+            if(!currentBestIsNone && currentBest->serverCertificate.length > 0) {
+                /* Current best is secure, skip this None endpoint */
+                continue;
+            }
+        }
+        
         bestEndpointLevel = endpoint->securityLevel;
         bestEndpointIndex = i;
     }
@@ -1494,9 +1713,25 @@ responseGetEndpoints(UA_Client *client, void *userdata,
      * preserve those UserTokenPolicies instead of using the ones from the server's endpoint.
      * This is necessary when the server doesn't return the exact UserTokenPolicy that the
      * client expects (e.g., for custom security policies like PQC). */
+    
+    /* [TRACE-CERT] Log serverCertificate BEFORE assignment */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-CERT] responseGetEndpoints: BEFORE assignment - "
+                "resp->endpoints[%zu].serverCertificate.length=%zu serverCertificate.data=%p",
+                bestEndpointIndex,
+                resp->endpoints[bestEndpointIndex].serverCertificate.length,
+                (void*)resp->endpoints[bestEndpointIndex].serverCertificate.data);
+    
     UA_EndpointDescription_clear(&client->endpoint);
     client->endpoint = resp->endpoints[bestEndpointIndex];
     UA_EndpointDescription_init(&resp->endpoints[bestEndpointIndex]);
+    
+    /* [TRACE-CERT] Log serverCertificate AFTER assignment */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-CERT] responseGetEndpoints: AFTER assignment - "
+                "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
+                client->endpoint.serverCertificate.length,
+                (void*)client->endpoint.serverCertificate.data);
     
     /* Log the selected endpoint's SecurityPolicy for debugging */
     UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
@@ -1550,10 +1785,30 @@ responseGetEndpoints(UA_Client *client, void *userdata,
         /* Planned reconnect with different SecurityPolicy/Mode.
          * Preserve the selected endpoint across the channel restart
          * to avoid re-entering discovery loop. */
+        
+        /* [TRACE-CERT] Log serverCertificate BEFORE copy */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: BEFORE copy - "
+                    "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p "
+                    "securityPolicyUri=%S",
+                    client->endpoint.serverCertificate.length,
+                    (void*)client->endpoint.serverCertificate.data,
+                    client->endpoint.securityPolicyUri);
+        
         UA_EndpointDescription preservedEndpoint;
         UA_EndpointDescription_init(&preservedEndpoint);
         UA_StatusCode copyRc =
             UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
+        
+        /* [TRACE-CERT] Log serverCertificate AFTER copy */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: AFTER copy - "
+                    "preservedEndpoint.serverCertificate.length=%zu serverCertificate.data=%p "
+                    "copyRc=%s",
+                    preservedEndpoint.serverCertificate.length,
+                    (void*)preservedEndpoint.serverCertificate.data,
+                    UA_StatusCode_name(copyRc));
+        
         if(copyRc != UA_STATUSCODE_GOOD) {
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
                            "Failed to preserve endpoint for reconnect (%s). "
@@ -1579,10 +1834,26 @@ responseGetEndpoints(UA_Client *client, void *userdata,
         /* Planned reconnect switching away from discovery URL.
          * Preserve the selected endpoint across the channel restart
          * to avoid re-entering discovery loop. */
+        
+        /* [TRACE-CERT] Log serverCertificate BEFORE copy (URL mismatch) */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: BEFORE copy (URL mismatch) - "
+                    "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
+                    client->endpoint.serverCertificate.length,
+                    (void*)client->endpoint.serverCertificate.data);
+        
         UA_EndpointDescription preservedEndpoint;
         UA_EndpointDescription_init(&preservedEndpoint);
         UA_StatusCode copyRc =
             UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
+        
+        /* [TRACE-CERT] Log serverCertificate AFTER copy (URL mismatch) */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: AFTER copy (URL mismatch) - "
+                    "preservedEndpoint.serverCertificate.length=%zu serverCertificate.data=%p",
+                    preservedEndpoint.serverCertificate.length,
+                    (void*)preservedEndpoint.serverCertificate.data);
+
         if(copyRc != UA_STATUSCODE_GOOD) {
             UA_LOG_WARNING(client->config.logging, UA_LOGCATEGORY_CLIENT,
                            "Failed to preserve endpoint for reconnect (%s). "
@@ -1595,6 +1866,14 @@ responseGetEndpoints(UA_Client *client, void *userdata,
 
         UA_EndpointDescription_clear(&client->endpoint);
         client->endpoint = preservedEndpoint;
+        
+        /* [TRACE-CERT] Log serverCertificate AFTER restore (URL mismatch) */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] responseGetEndpoints: AFTER restore (URL mismatch) - "
+                    "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
+                    client->endpoint.serverCertificate.length,
+                    (void*)client->endpoint.serverCertificate.data);
+        
         /* Clear discoveryUrl so next connectActivity does not re-enter discovery */
         UA_String_clear(&client->discoveryUrl);
         return;
@@ -1992,8 +2271,21 @@ initSecurityPolicy(UA_Client *client) {
      * the policy mismatch and trigger reconnection with PQC after obtaining
      * the server certificate. */
     static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
+    
+    /* [TRACE-CERT] Log serverCertificate in initSecurityPolicy before PQC check */
+    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                "[TRACE-CERT] initSecurityPolicy: BEFORE PQC check - "
+                "sp->policyUri=%S endpoint.securityPolicyUri=%S "
+                "endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
+                sp->policyUri, client->endpoint.securityPolicyUri,
+                client->endpoint.serverCertificate.length,
+                (void*)client->endpoint.serverCertificate.data);
+    
     if(UA_String_equal(&sp->policyUri, &pqcPolicyUri) &&
        client->endpoint.serverCertificate.length == 0) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] initSecurityPolicy: PQC policy but serverCertificate.length==0 - "
+                    "falling back to SecurityPolicy#None");
         UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "initSecurityPolicy: PQC policy selected but server certificate not available. "
                     "Using SecurityPolicy#None for discovery. Endpoint will trigger reconnection after GetEndpoints.");
@@ -2533,6 +2825,13 @@ initConnect(UA_Client *client) {
         UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "initConnect: Using preserved endpoint with SecurityPolicy=%S",
                     client->endpoint.securityPolicyUri);
+        
+        /* [TRACE-CERT] Log serverCertificate in initConnect */
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    "[TRACE-CERT] initConnect: preserved endpoint - "
+                    "serverCertificate.length=%zu serverCertificate.data=%p",
+                    client->endpoint.serverCertificate.length,
+                    (void*)client->endpoint.serverCertificate.data);
     } else if(!endpointUnconfigured(&client->config.endpoint)) {
         /* Use configured endpoint from client config */
         UA_EndpointDescription_clear(&client->endpoint);
