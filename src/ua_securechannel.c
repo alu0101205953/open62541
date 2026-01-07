@@ -45,6 +45,16 @@ UA_StatusCode
 UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
                                    UA_SecurityPolicy *securityPolicy,
                                    const UA_ByteString *remoteCertificate) {
+    UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: ENTRY. "
+                "channel.securityPolicy=%p new_securityPolicy=%p policyUri=%S policyUri.length=%zu "
+                "remoteCertificate.length=%zu",
+                (void*)channel->securityPolicy,
+                (void*)securityPolicy,
+                securityPolicy->policyUri,
+                securityPolicy->policyUri.length,
+                remoteCertificate ? remoteCertificate->length : 0);
+    
     /* Is a policy already configured? */
     if(channel->securityPolicy) {
         UA_LOG_ERROR(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
@@ -79,13 +89,33 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
     UA_StatusCode res = securityPolicy->channelModule.
         newContext(securityPolicy, certForContext, &channel->channelContext);
     
+    UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: After newContext. "
+                "res=%s channelContext=%p",
+                UA_StatusCode_name(res),
+                (void*)channel->channelContext);
+    
     if(allowEmptyCert) {
         UA_ByteString_init(&channel->remoteCertificate);
+        UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: allowEmptyCert=true, initialized empty certificate");
     } else {
-    res |= UA_ByteString_copy(remoteCertificate, &channel->remoteCertificate);
-    UA_CHECK_STATUS_WARN(res, return res, securityPolicy->logger,
-                         UA_LOGCATEGORY_SECURITYPOLICY,
-                         "Could not set up the SecureChannel context");
+        res |= UA_ByteString_copy(remoteCertificate, &channel->remoteCertificate);
+        UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: After ByteString_copy. "
+                    "res=%s remoteCertificate.length=%zu",
+                    UA_StatusCode_name(res),
+                    channel->remoteCertificate.length);
+        if(res != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: ERROR - ByteString_copy failed. "
+                        "res=%s channel.securityPolicy=%p (NOT SET - returning early)",
+                        UA_StatusCode_name(res),
+                        (void*)channel->securityPolicy);
+        }
+        UA_CHECK_STATUS_WARN(res, return res, securityPolicy->logger,
+                             UA_LOGCATEGORY_SECURITYPOLICY,
+                             "Could not set up the SecureChannel context");
     }
 
     /* Compute the certificate thumbprint */
@@ -108,6 +138,13 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
 
     /* Set the policy */
     channel->securityPolicy = securityPolicy;
+
+    UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: Successfully set securityPolicy. "
+                "channel.securityPolicy=%p policyUri=%S policyUri.length=%zu",
+                (void*)channel->securityPolicy,
+                channel->securityPolicy->policyUri,
+                channel->securityPolicy->policyUri.length);
 
     return UA_STATUSCODE_GOOD;
 }
@@ -307,6 +344,14 @@ UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
     if(!UA_SecureChannel_isConnected(channel))
         return UA_STATUSCODE_BADCONNECTIONCLOSED;
 
+    const UA_SecurityPolicy *sp = channel->securityPolicy;
+    const UA_Logger *logger = sp ? sp->logger : NULL;
+
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: ENTRY. "
+                "channel.securityPolicy=%p requestId=%u contentType=%s",
+                (void*)sp, requestId, contentType ? contentType->typeName : "(null)");
+
     /* Allocate the message buffer */
     UA_ByteString buf = UA_BYTESTRING_NULL;
     UA_StatusCode res = cm->allocNetworkBuffer(cm, channel->connectionId, &buf,
@@ -314,13 +359,20 @@ UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
     UA_CHECK_STATUS(res, return res);
 
     /* Calculate header sizes first */
-    const UA_SecurityPolicy *sp = channel->securityPolicy;
     #define UA_SECURECHANNEL_ASYMMETRIC_SECURITYHEADER_FIXED_LENGTH 12
     size_t securityHeaderLength = UA_SECURECHANNEL_ASYMMETRIC_SECURITYHEADER_FIXED_LENGTH +
                                   (sp ? sp->policyUri.length : 0);
     size_t headerSpace = UA_SECURECHANNEL_CHANNELHEADER_LENGTH +
                          securityHeaderLength +
                          UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
+
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Buffer allocated. "
+                "sp=%p sp->policyUri.length=%zu securityHeaderLength=%zu headerSpace=%zu",
+                (void*)sp,
+                sp ? sp->policyUri.length : 0,
+                securityHeaderLength,
+                headerSpace);
 
     /* Reserve space for headers at the beginning, encode payload after headers */
     UA_Byte *buf_pos = &buf.data[headerSpace];
@@ -331,10 +383,67 @@ UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
     UA_EncodeBinaryOptions encOpts;
     memset(&encOpts, 0, sizeof(UA_EncodeBinaryOptions));
     encOpts.namespaceMapping = channel->namespaceMapping;
+    
+    /* Log OpenSecureChannelRequest fields before encoding */
+    if(contentType == &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST] && content) {
+        const UA_OpenSecureChannelRequest *opnReq = (const UA_OpenSecureChannelRequest *)content;
+        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                    "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding OpenSecureChannelRequest. "
+                    "RequestHeader: timestamp=%lld requestHandle=%u returnDiagnostics=%u "
+                    "auditEntryId.length=%zu auditEntryId.data=%p (NULL=%d) timeoutHint=%u "
+                    "additionalHeader.encoding=%d additionalHeader.content.encoded.body.length=%zu additionalHeader.content.encoded.body.data=%p (NULL=%d) "
+                    "authenticationToken.identifierType=%d authenticationToken.identifier.numeric=%u "
+                    "securityMode=%d clientNonce.length=%zu clientNonce.data=%p (NULL=%d) "
+                    "requestedLifetime=%u requestType=%d",
+                    (long long)opnReq->requestHeader.timestamp,
+                    opnReq->requestHeader.requestHandle,
+                    opnReq->requestHeader.returnDiagnostics,
+                    opnReq->requestHeader.auditEntryId.length,
+                    (void*)opnReq->requestHeader.auditEntryId.data,
+                    (opnReq->requestHeader.auditEntryId.data == NULL ? 1 : 0),
+                    opnReq->requestHeader.timeoutHint,
+                    (int)opnReq->requestHeader.additionalHeader.encoding,
+                    opnReq->requestHeader.additionalHeader.content.encoded.body.length,
+                    (void*)opnReq->requestHeader.additionalHeader.content.encoded.body.data,
+                    (opnReq->requestHeader.additionalHeader.content.encoded.body.data == NULL ? 1 : 0),
+                    (int)opnReq->requestHeader.authenticationToken.identifierType,
+                    opnReq->requestHeader.authenticationToken.identifier.numeric,
+                    (int)opnReq->securityMode,
+                    opnReq->clientNonce.length,
+                    (void*)opnReq->clientNonce.data,
+                    (opnReq->clientNonce.data == NULL ? 1 : 0),
+                    opnReq->requestedLifetime,
+                    (int)opnReq->requestType);
+    }
+    
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Encoding NodeId (contentType->binaryEncodingId). "
+                "buf_pos offset=%zu buf_end offset=%zu",
+                (size_t)(buf_pos - buf.data),
+                (size_t)(buf_end - buf.data));
+    
     res |= UA_NodeId_encodeBinary(&contentType->binaryEncodingId, &buf_pos, buf_end);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After NodeId encoding. res=%s buf_pos offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(buf_pos - buf.data));
+    UA_CHECK_STATUS(res, goto error);
+
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding OpenSecureChannelRequest payload. "
+                "buf_pos offset=%zu buf_end offset=%zu",
+                (size_t)(buf_pos - buf.data),
+                (size_t)(buf_end - buf.data));
+    
     const UA_Byte *buf_end_ptr = buf_end;
     res |= UA_encodeBinaryInternal(content, contentType, &buf_pos, &buf_end_ptr,
                                    &encOpts, NULL, NULL);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After OpenSecureChannelRequest encoding. "
+                "res=%s buf_pos offset=%zu payload_length=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(buf_pos - buf.data),
+                (size_t)(buf_pos - payload_start));
     UA_CHECK_STATUS(res, goto error);
 
     /* Calculate payload length */
@@ -346,27 +455,80 @@ UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
     const UA_Byte *buf_end_for_header = payload_start;
 
     /* Encode TCP MessageHeader */
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding TCP MessageHeader. "
+                "header_pos offset=0 buf_end_for_header offset=%zu total_length=%zu",
+                (size_t)(buf_end_for_header - buf.data),
+                total_length);
+    
     UA_TcpMessageHeader messageHeader;
     messageHeader.messageTypeAndChunkType = UA_MESSAGETYPE_OPN + UA_CHUNKTYPE_FINAL;
     messageHeader.messageSize = (UA_UInt32)total_length;
     res |= UA_encodeBinaryInternal(&messageHeader, &UA_TRANSPORT[UA_TRANSPORT_TCPMESSAGEHEADER],
                                    &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After TCP MessageHeader encoding. "
+                "res=%s header_pos offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(header_pos - buf.data));
     UA_CHECK_STATUS(res, goto error);
 
     /* Encode SecureChannelId (0 for initial OPN) */
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding SecureChannelId. "
+                "secureChannelId=%u header_pos offset=%zu",
+                channel->securityToken.channelId,
+                (size_t)(header_pos - buf.data));
+    
     UA_UInt32 secureChannelId = channel->securityToken.channelId;
-    res |= UA_UInt32_encodeBinary(&secureChannelId, &header_pos, &buf_end_for_header);
+    res |= UA_UInt32_encodeBinary(&secureChannelId, &header_pos, buf_end_for_header);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After SecureChannelId encoding. "
+                "res=%s header_pos offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(header_pos - buf.data));
     UA_CHECK_STATUS(res, goto error);
 
     /* Encode AsymmetricSecurityHeader (SecurityPolicy#None: policyUri only, NO certificates) */
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding AsymmetricSecurityHeader. "
+                "sp=%p header_pos offset=%zu",
+                (void*)sp,
+                (size_t)(header_pos - buf.data));
+    
     UA_AsymmetricAlgorithmSecurityHeader asymHeader;
     UA_AsymmetricAlgorithmSecurityHeader_init(&asymHeader);
     if(sp) {
         asymHeader.securityPolicyUri = sp->policyUri;
+        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                    "[TRACE-ENCODE] sendUnsecuredOPNMessage: AsymmetricSecurityHeader prepared. "
+                    "securityPolicyUri.length=%zu securityPolicyUri.data=%p (NULL=%d) "
+                    "securityPolicyUri=%S senderCertificate.length=%zu senderCertificate.data=%p (NULL=%d) "
+                    "receiverCertificateThumbprint.length=%zu receiverCertificateThumbprint.data=%p (NULL=%d)",
+                    asymHeader.securityPolicyUri.length,
+                    (void*)asymHeader.securityPolicyUri.data,
+                    (asymHeader.securityPolicyUri.data == NULL ? 1 : 0),
+                    asymHeader.securityPolicyUri,
+                    asymHeader.senderCertificate.length,
+                    (void*)asymHeader.senderCertificate.data,
+                    (asymHeader.senderCertificate.data == NULL ? 1 : 0),
+                    asymHeader.receiverCertificateThumbprint.length,
+                    (void*)asymHeader.receiverCertificateThumbprint.data,
+                    (asymHeader.receiverCertificateThumbprint.data == NULL ? 1 : 0));
+    } else {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                    "[TRACE-ENCODE] sendUnsecuredOPNMessage: ERROR - sp is NULL! "
+                    "securityPolicyUri will be empty");
     }
+    
     /* For SecurityPolicy#None, senderCertificate and receiverCertificateThumbprint are NOT included */
     res |= UA_encodeBinaryInternal(&asymHeader, &UA_TRANSPORT[UA_TRANSPORT_ASYMMETRICALGORITHMSECURITYHEADER],
                                    &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After AsymmetricSecurityHeader encoding. "
+                "res=%s header_pos offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(header_pos - buf.data));
     /* Do NOT call UA_AsymmetricAlgorithmSecurityHeader_clear here.
      * asymHeader.securityPolicyUri is a shallow copy of sp->policyUri, which belongs to
      * the SecurityPolicy, not to asymHeader. Calling clear would attempt to free memory
@@ -375,19 +537,44 @@ UA_SecureChannel_sendUnsecuredOPNMessage(UA_SecureChannel *channel,
     UA_CHECK_STATUS(res, goto error);
 
     /* Encode SequenceHeader */
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: Before encoding SequenceHeader. "
+                "requestId=%u sequenceNumber=0 header_pos offset=%zu",
+                requestId,
+                (size_t)(header_pos - buf.data));
+    
     UA_SequenceHeader seqHeader;
     seqHeader.requestId = requestId;
     seqHeader.sequenceNumber = 0; /* OPN messages always have sequenceNumber = 0 */
     res |= UA_encodeBinaryInternal(&seqHeader, &UA_TRANSPORT[UA_TRANSPORT_SEQUENCEHEADER],
                                    &header_pos, &buf_end_for_header, NULL, NULL, NULL);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After SequenceHeader encoding. "
+                "res=%s header_pos offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(header_pos - buf.data));
     UA_CHECK_STATUS(res, goto error);
 
     /* Set final buffer length and send */
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: All encoding complete. "
+                "total_length=%zu buf.length=%zu sending message",
+                total_length, buf.length);
+    
     buf.length = total_length;
     res = cm->sendWithConnection(cm, channel->connectionId, &UA_KEYVALUEMAP_NULL, &buf);
+    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: After sendWithConnection. res=%s",
+                UA_StatusCode_name(res));
     return res;
 
 error:
+    UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURECHANNEL,
+                "[TRACE-ENCODE] sendUnsecuredOPNMessage: ERROR during encoding. res=%s "
+                "header_pos offset=%zu payload_start offset=%zu",
+                UA_StatusCode_name(res),
+                (size_t)(header_pos - buf.data),
+                (size_t)(payload_start - buf.data));
     cm->freeNetworkBuffer(cm, channel->connectionId, &buf);
     return res;
 }
