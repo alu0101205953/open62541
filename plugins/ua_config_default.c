@@ -1947,6 +1947,88 @@ UA_ClientConfig_setDefaultEncryption(UA_ClientConfig *config,
 }
 #endif
 
+#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
+
+UA_StatusCode
+UA_ClientConfig_setDefaultWithFilestore(UA_ClientConfig *config,
+                                        const UA_ByteString *localCertificate,
+                                        const UA_ByteString *privateKey,
+                                        const UA_String storePath) {
+    UA_StatusCode retval = UA_ClientConfig_setDefault(config);
+    if(retval != UA_STATUSCODE_GOOD) {
+        return retval;
+    }
+
+    if(!storePath.data) {
+        UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_USERLAND,
+                     "The path to a PKI folder has not been specified");
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+
+    UA_KeyValuePair params[2];
+    size_t paramsSize = 2;
+
+    params[0].key = UA_QUALIFIEDNAME(0, "max-trust-listsize");
+    UA_Variant_setScalar(&params[0].value, &config->maxTrustListSize,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    params[1].key = UA_QUALIFIEDNAME(0, "max-rejected-listsize");
+    UA_Variant_setScalar(&params[1].value, &config->maxRejectedListSize,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+
+    UA_KeyValueMap paramsMap;
+    paramsMap.map = params;
+    paramsMap.mapSize = paramsSize;
+
+    if(config->certificateVerification.clear)
+        config->certificateVerification.clear(&config->certificateVerification);
+
+    UA_NodeId defaultApplicationGroup =
+        UA_NS0ID(SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTAPPLICATIONGROUP);
+    retval = UA_CertificateGroup_Filestore(&config->certificateVerification,
+                                           &defaultApplicationGroup,
+                                           storePath,
+                                           config->logging,
+                                           &paramsMap);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+    
+    UA_ByteString decryptedPrivateKey = UA_BYTESTRING_NULL;
+    UA_ByteString keyPassword = UA_BYTESTRING_NULL;
+    UA_StatusCode keySuccess = UA_STATUSCODE_GOOD;
+
+    if(privateKey && privateKey->length > 0)
+        keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword,
+                                                           &decryptedPrivateKey);
+
+    /* Get the password and decrypt. An application might want to loop / retry
+     * here to allow users to correct their entry. */
+    if(keySuccess != UA_STATUSCODE_GOOD) {
+        if(config->privateKeyPasswordCallback)
+            keySuccess = config->privateKeyPasswordCallback(config, &keyPassword);
+        else
+            keySuccess = readPrivateKeyPassword(&keyPassword);
+        if(keySuccess != UA_STATUSCODE_GOOD)
+            return keySuccess;
+        keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword, &decryptedPrivateKey);
+        UA_ByteString_memZero(&keyPassword);
+        UA_ByteString_clear(&keyPassword);
+    }
+    if(keySuccess != UA_STATUSCODE_GOOD)
+        return keySuccess;
+
+    if(localCertificate && localCertificate->length > 0) {
+        clientConfig_setSecurityPolicies(config, *localCertificate, decryptedPrivateKey);
+        clientConfig_setAuthenticationSecurityPolicies(config, *localCertificate, decryptedPrivateKey);
+    }
+
+    UA_ByteString_memZero(&decryptedPrivateKey);
+    UA_ByteString_clear(&decryptedPrivateKey);
+
+    return UA_STATUSCODE_GOOD;
+}
+
+#endif /* defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) */
+
 #if defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_MBEDTLS)
 UA_StatusCode
 UA_ClientConfig_setAuthenticationCert(UA_ClientConfig *config,

@@ -592,6 +592,15 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
         return UA_STATUSCODE_BADINVALIDARGUMENT;
 
     FileCertStore *context = (FileCertStore *)certGroup->context;
+    
+    /* Log for tracing */
+    if(certGroup->logging) {
+        UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-VERIFY] FileCertStore_verifyCertificate called: cert.length=%zu, trustedFolder=%.*s",
+                    certificate->length,
+                    (int)context->trustedCertFolder.length, context->trustedCertFolder.data);
+    }
+    
     /* It will only re-read the Cert store on the file system if there have been changes to files. */
     UA_StatusCode retval = reloadTrustStore(certGroup);
     if(retval != UA_STATUSCODE_GOOD) {
@@ -630,7 +639,7 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
                 retval = writeByteStringToFile(filename, certificate);
                 if(retval == UA_STATUSCODE_GOOD && certGroup->logging) {
                     UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
-                               "Certificate saved to rejected directory: %s "
+                               "[FILESTORE-REJECTED] Certificate written to rejected/: %s "
                                "(Administrator must manually move to trusted directory to trust it)",
                                filename);
                 }
@@ -714,6 +723,14 @@ UA_CertificateGroup_Filestore(UA_CertificateGroup *certGroup,
     certGroup->getCertificateCrls = FileCertStore_getCertificateCrls;
     certGroup->verifyCertificate = FileCertStore_verifyCertificate;
     certGroup->clear = FileCertStore_clear;
+
+    /* Log initialization for tracing */
+    if(logger) {
+        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-INIT] CertificateGroup_Filestore initialized: verifyCertificate=%p, storePath=%.*s",
+                    (void*)certGroup->verifyCertificate,
+                    (int)storePath.length, storePath.data);
+    }
 
     /* Set PKI Store context data */
     FileCertStore *context = (FileCertStore *)UA_calloc(1, sizeof(FileCertStore));

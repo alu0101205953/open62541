@@ -2856,6 +2856,15 @@ initConnect(UA_Client *client) {
     client->channel.securityMode = UA_MESSAGESECURITYMODE_NONE;
     client->channel.config = client->config.localConnectionConfig;
     client->channel.certificateVerification = &client->config.certificateVerification;
+    
+    /* Log for tracing */
+    if(client->config.logging && client->channel.certificateVerification) {
+        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-CLIENT-CHANNEL] certificateVerification=%p, verifyCertificate=%p",
+                    (void*)client->channel.certificateVerification,
+                    (void*)client->channel.certificateVerification->verifyCertificate);
+    }
+    
     client->channel.processOPNHeader = verifyClientSecureChannelHeader;
     client->channel.processOPNHeaderApplication = client;
 

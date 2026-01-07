@@ -794,6 +794,16 @@ createServerSecureChannel(UA_BinaryProtocolManager *bpm, UA_ConnectionManager *c
     UA_SecureChannel_init(channel);
     channel->config = connConfig;
     channel->certificateVerification = &config->secureChannelPKI;
+    
+    /* Log for tracing */
+    if(config->logging && channel->certificateVerification) {
+        UA_LOG_INFO(config->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-SERVER-CHANNEL] Channel %u: certificateVerification=%p, verifyCertificate=%p",
+                    channel->securityToken.channelId,
+                    (void*)channel->certificateVerification,
+                    (void*)channel->certificateVerification->verifyCertificate);
+    }
+    
     channel->processOPNHeader = configServerSecureChannel;
     channel->processOPNHeaderApplication = server;
     channel->connectionManager = cm;

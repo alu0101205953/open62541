@@ -13,6 +13,7 @@
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
 #include <open62541/plugin/certificategroup_default.h>
+#include <open62541/plugin/securitypolicy_default.h>
 #include <string.h>
 #include <open62541/plugin/securitypolicy_pqc.h>
 
@@ -34,12 +35,24 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "common.h"
 
 UA_Boolean running = true;
 static void stopHandler(int sig) {
     running = false;
+}
+
+/* Utility functions for PKI FileStore */
+static bool pathExists(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0);
+}
+
+static bool fileExists(const char *path) {
+    return (access(path, F_OK) == 0);
 }
 
 int main(int argc, char* argv[]) {
@@ -49,25 +62,70 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
     UA_ByteString certificate = UA_BYTESTRING_NULL;
     UA_ByteString privateKey = UA_BYTESTRING_NULL;
+    UA_String storePath = UA_STRING_NULL;
     bool onlySecure = false;
     bool allowDiscovery = false;
     char *clientSigKeyFile = NULL;
     char *clientKemKeyFile = NULL;
     
-    if(argc >= 3) {
-            certificate = loadFile(argv[1]);
-            privateKey = loadFile(argv[2]);
-            
-            /* Validate that files were loaded successfully */
-            if(certificate.length == 0 || privateKey.length == 0) {
-                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                    "Failed to load certificate or private key file.");
-                if(certificate.length > 0)
-                    UA_ByteString_clear(&certificate);
-                if(privateKey.length > 0)
-                    UA_ByteString_clear(&privateKey);
-                return EXIT_FAILURE;
-            }
+    /* Determine PKI store path - use command line argument or default to current directory */
+    if(argc >= 4) {
+        storePath = UA_STRING(argv[3]);
+    } else {
+        char storePathDir[4096];
+        if(!getcwd(storePathDir, sizeof(storePathDir))) {
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                         "Can't retrieve current working directory.");
+            return EXIT_FAILURE;
+        }
+        storePath = UA_STRING(storePathDir);
+    }
+    
+    /* Build paths to own certificate and private key in PKI */
+    char certDir[4096], keyDir[4096];
+    snprintf(certDir, sizeof(certDir), "%.*s/own/certs",
+             (int)storePath.length, storePath.data);
+    snprintf(keyDir, sizeof(keyDir), "%.*s/own/private",
+             (int)storePath.length, storePath.data);
+    
+    char certPath[4096], keyPath[4096];
+    snprintf(certPath, sizeof(certPath), "%s/server_cert.der", certDir);
+    snprintf(keyPath, sizeof(keyPath), "%s/server_key.der", keyDir);
+    
+    /* Load certificate and private key from PKI FileStore */
+    if(fileExists(certPath) && fileExists(keyPath)) {
+        certificate = loadFile(certPath);
+        privateKey = loadFile(keyPath);
+        
+        /* Validate that files were loaded successfully */
+        if(certificate.length == 0 || privateKey.length == 0) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                "Failed to load certificate or private key from PKI FileStore.");
+            if(certificate.length > 0)
+                UA_ByteString_clear(&certificate);
+            if(privateKey.length > 0)
+                UA_ByteString_clear(&privateKey);
+            return EXIT_FAILURE;
+        }
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Loaded certificate and private key from PKI FileStore: %s", certPath);
+    } else if(argc >= 3) {
+        /* Fallback: load from command line arguments (for backward compatibility) */
+        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                       "Certificate or key not found in PKI FileStore. Loading from command line arguments.");
+        certificate = loadFile(argv[1]);
+        privateKey = loadFile(argv[2]);
+        
+        /* Validate that files were loaded successfully */
+        if(certificate.length == 0 || privateKey.length == 0) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                "Failed to load certificate or private key file.");
+            if(certificate.length > 0)
+                UA_ByteString_clear(&certificate);
+            if(privateKey.length > 0)
+                UA_ByteString_clear(&privateKey);
+            return EXIT_FAILURE;
+        }
     } else {
         /* Generate PQC certificate directly (requires OpenSSL 3.0+ and OQS Provider) */
         UA_String subject[3] = {UA_STRING_STATIC("C=DE"),
@@ -131,7 +189,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    /* Parse command line options first (before loading trust list) */
+    /* Parse command line options */
     for(int argpos = 1; argpos < argc; argpos++) {
         if(strcmp(argv[argpos], "--onlySecure") == 0) {
             onlySecure = true;
@@ -151,78 +209,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* Load the trustlist */
-    /* Note: Arguments after argv[3] can be trust lists or options like --onlySecure, --allowDiscovery, etc.
-     * We need to count only arguments that are trust list files */
-    size_t trustListSize = 0;
-    size_t trustListArgCount = 0;
-    if(argc > 3) {
-        /* Count arguments that are not options */
-        for(int argpos = 3; argpos < argc; argpos++) {
-            if(strcmp(argv[argpos], "--onlySecure") == 0 ||
-               strcmp(argv[argpos], "--allowDiscovery") == 0 ||
-               strcmp(argv[argpos], "--clientSigKey") == 0 ||
-               strcmp(argv[argpos], "--clientKemKey") == 0) {
-                if(strcmp(argv[argpos], "--clientSigKey") == 0 || strcmp(argv[argpos], "--clientKemKey") == 0) {
-                    argpos++; /* Skip option value */
-                }
-                continue;
-            }
-            trustListArgCount++;
-        }
-        trustListSize = trustListArgCount;
-    }
-    
-    UA_STACKARRAY(UA_ByteString, trustList, trustListSize+1);
-    size_t trustListIdx = 0;
-    for(int argpos = 3; argpos < argc && trustListIdx < trustListSize; argpos++) {
-        if(strcmp(argv[argpos], "--onlySecure") == 0 ||
-           strcmp(argv[argpos], "--allowDiscovery") == 0 ||
-           strcmp(argv[argpos], "--clientSigKey") == 0 ||
-           strcmp(argv[argpos], "--clientKemKey") == 0) {
-            if(strcmp(argv[argpos], "--clientSigKey") == 0 || strcmp(argv[argpos], "--clientKemKey") == 0) {
-                argpos++; /* Skip option value */
-            }
-            continue;
-        }
-        trustList[trustListIdx] = loadFile(argv[argpos]);
-        trustListIdx++;
-    }
-
-    /* Loading of an issuer list, not used in this application */
-    size_t issuerListSize = 0;
-    UA_ByteString *issuerList = NULL;
-
-    /* Revocation lists are supported, but not used for the example here */
-    UA_ByteString *revocationList = NULL;
-    size_t revocationListSize = 0;
-
     UA_Server *server = UA_Server_new();
     if(!server) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "Failed to create server.");
         UA_ByteString_clear(&certificate);
         UA_ByteString_clear(&privateKey);
-        for(size_t i = 0; i < trustListSize; i++) {
-            UA_ByteString_clear(&trustList[i]);
-        }
+        UA_String_clear(&storePath);
         return EXIT_FAILURE;
     }
     UA_ServerConfig *config = UA_Server_getConfig(server);
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    if(onlySecure) {
-        retval = UA_ServerConfig_setDefaultWithSecureSecurityPolicies(config, 4840,
-                                                                      &certificate, &privateKey,
-                                                                      trustList, trustListSize,
-                                                                      issuerList, issuerListSize,
-                                                                      revocationList, revocationListSize);
-    } else {
-        retval = UA_ServerConfig_setDefaultWithSecurityPolicies(config, 4840,
-                                                                &certificate, &privateKey,
-                                                                trustList, trustListSize,
-                                                                issuerList, issuerListSize,
-                                                                revocationList, revocationListSize);
+    
+    /* Configure server with PKI FileStore - this sets up the PKI structure */
+    /* Note: We pass NULL for certificate/privateKey here because we'll add PQC policy separately */
+    /* But we need to pass them to create the PKI structure, so we use empty strings */
+    UA_ByteString emptyCert = UA_BYTESTRING_NULL;
+    UA_ByteString emptyKey = UA_BYTESTRING_NULL;
+    
+    /* First, set up basic config without security policies */
+    retval = UA_ServerConfig_setDefault(config, 4840);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to set default config: %s",
+                    UA_StatusCode_name(retval));
+        goto cleanup;
     }
 
     /* Increase buffer limits to avoid rejected messages */
@@ -231,54 +243,80 @@ int main(int argc, char* argv[]) {
     config->tcpMaxMsgSize = 1 << 30;  /* 1 GiB */
     config->tcpMaxChunks  = 1 << 20;  /* 1M chunks */
 
-#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
-    /* Add PQC policy to server */
-    /* Verify that the policies array is initialized */
-    if(!config->securityPolicies && config->securityPoliciesSize > 0) {
-        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Security policies array is NULL but size is not zero");
-        goto cleanup;
-    }
-    
-    /* Use malloc if array is NULL, realloc if it already exists */
-    UA_SecurityPolicy *tmp;
-    if(config->securityPolicies == NULL) {
-        tmp = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy) * (config->securityPoliciesSize + 1));
-    } else {
-        tmp = (UA_SecurityPolicy *)UA_realloc(config->securityPolicies,
-                                               sizeof(UA_SecurityPolicy) * (config->securityPoliciesSize + 1));
-    }
-    if(!tmp) {
-        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Memory allocation failed for security policies array (size: %zu)",
-                     config->securityPoliciesSize + 1);
-        goto cleanup;
-    }
-    config->securityPolicies = tmp;
+    /* Set up PKI FileStore */
+    UA_KeyValuePair params[2];
+    size_t paramsSize = 2;
+    params[0].key = UA_QUALIFIEDNAME(0, "max-trust-listsize");
+    UA_Variant_setScalar(&params[0].value, &config->maxTrustListSize, &UA_TYPES[UA_TYPES_UINT32]);
+    params[1].key = UA_QUALIFIEDNAME(0, "max-rejected-listsize");
+    UA_Variant_setScalar(&params[1].value, &config->maxRejectedListSize, &UA_TYPES[UA_TYPES_UINT32]);
+    UA_KeyValueMap paramsMap;
+    paramsMap.map = params;
+    paramsMap.mapSize = paramsSize;
 
-    /* Initialize PQC policy directly in the array */
-    /* First initialize structure to zero to avoid issues */
-    memset(&config->securityPolicies[config->securityPoliciesSize], 0, sizeof(UA_SecurityPolicy));
-    
-    retval = UA_SecurityPolicy_PQC(&config->securityPolicies[config->securityPoliciesSize],
-                                   certificate, privateKey, UA_Log_Stdout);
+    UA_NodeId defaultApplicationGroup =
+            UA_NS0ID(SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTAPPLICATIONGROUP);
+    retval = UA_CertificateGroup_Filestore(&config->secureChannelPKI, &defaultApplicationGroup,
+                                           storePath, config->logging, &paramsMap);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                     "Failed to initialize PQC SecurityPolicy: %s",
-                     UA_StatusCode_name(retval));
-        /* Clean up policy if partially initialized */
-        if(config->securityPolicies[config->securityPoliciesSize].clear) {
-            config->securityPolicies[config->securityPoliciesSize].clear(
-                &config->securityPolicies[config->securityPoliciesSize]);
-        }
-        if(config->securityPoliciesSize == 0) {
-            UA_free(config->securityPolicies);
-            config->securityPolicies = NULL;
-        }
+                    "Failed to configure secureChannelPKI FileStore: %s",
+                    UA_StatusCode_name(retval));
         goto cleanup;
     }
 
-    config->securityPoliciesSize++;
+    UA_NodeId defaultUserTokenGroup =
+            UA_NS0ID(SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTUSERTOKENGROUP);
+    retval = UA_CertificateGroup_Filestore(&config->sessionPKI, &defaultUserTokenGroup,
+                                           storePath, config->logging, &paramsMap);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to configure sessionPKI FileStore: %s",
+                    UA_StatusCode_name(retval));
+        goto cleanup;
+    }
+
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+    /* Add PQC policy to server with filestore support */
+    /* Initialize policies array */
+    config->securityPoliciesSize = 0;
+    config->securityPolicies = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
+    if(!config->securityPolicies) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Memory allocation failed for PQC policy");
+        goto cleanup;
+    }
+    memset(config->securityPolicies, 0, sizeof(UA_SecurityPolicy));
+
+    /* First create the inner PQC policy */
+    UA_SecurityPolicy *innerPqcPolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
+    if(!innerPqcPolicy) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Memory allocation failed for inner PQC policy");
+        goto cleanup;
+    }
+    memset(innerPqcPolicy, 0, sizeof(UA_SecurityPolicy));
+    
+    retval = UA_SecurityPolicy_PQC(innerPqcPolicy, certificate, privateKey, UA_Log_Stdout);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Failed to initialize inner PQC SecurityPolicy: %s",
+                     UA_StatusCode_name(retval));
+        UA_free(innerPqcPolicy);
+        goto cleanup;
+    }
+
+    /* Wrap PQC policy with filestore */
+    retval = UA_SecurityPolicy_Filestore(&config->securityPolicies[0], innerPqcPolicy, storePath);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Failed to wrap PQC SecurityPolicy with Filestore: %s",
+                     UA_StatusCode_name(retval));
+        innerPqcPolicy->clear(innerPqcPolicy);
+        UA_free(innerPqcPolicy);
+        goto cleanup;
+    }
+    config->securityPoliciesSize = 1;
 #endif
 
     /* Adds the None policy to the security policy list, but does not provide a None endpoint.
@@ -303,13 +341,6 @@ int main(int argc, char* argv[]) {
                      UA_StatusCode_name(retval));
         goto cleanup;
     }
-
-    /* Accept all certificates */
-    config->secureChannelPKI.clear(&config->secureChannelPKI);
-    UA_CertificateGroup_AcceptAll(&config->secureChannelPKI);
-
-    config->sessionPKI.clear(&config->sessionPKI);
-    UA_CertificateGroup_AcceptAll(&config->sessionPKI);
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
     if(clientSigKeyFile && clientKemKeyFile) {
@@ -348,8 +379,6 @@ int main(int argc, char* argv[]) {
     
     UA_ByteString_clear(&certificate);
     UA_ByteString_clear(&privateKey);
-    for(size_t i = 0; i < trustListSize; i++)
-        UA_ByteString_clear(&trustList[i]);
 
     if(!running)
         goto cleanup; /* received ctrl-c already */
@@ -359,5 +388,8 @@ int main(int argc, char* argv[]) {
 
  cleanup:
     UA_Server_delete(server);
+    UA_ByteString_clear(&certificate);
+    UA_ByteString_clear(&privateKey);
+    UA_String_clear(&storePath);
     return retval == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }
