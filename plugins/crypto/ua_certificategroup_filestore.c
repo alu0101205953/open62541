@@ -9,9 +9,13 @@
 
 #include <open62541/util.h>
 #include <open62541/plugin/certificategroup_default.h>
+#include <open62541/plugin/securitypolicy_pqc.h>
+#include <open62541/plugin/log_stdout.h>
 
 #include "ua_filestore_common.h"
 #include "mp_printf.h"
+
+#include <errno.h>
 
 #ifdef UA_ENABLE_ENCRYPTION
 
@@ -169,8 +173,30 @@ readCertificates(UA_ByteString **list, size_t *listSize, const UA_String path) {
     /* Determine number of certificates */
     size_t numCerts = 0;
     UA_DIR *dir = UA_opendir(listPath);
-    if(!dir)
+    if(!dir) {
+        /* If directory doesn't exist (ENOENT), treat as empty trust store */
+        /* ENOENT is defined on both POSIX and Windows */
+        if(errno == ENOENT) {
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "[FILESTORE] Missing PKI directory treated as empty: %s",
+                       listPath);
+            /* Return empty list */
+            if(list) {
+                *list = NULL;
+            }
+            if(listSize) {
+                *listSize = 0;
+            }
+            return UA_STATUSCODE_GOOD;
+        }
+        
+        /* For other errors, log and return error */
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[DIAG-readCertificates] BADINTERNALERROR: UA_opendir failed - "
+                    "listPath=%s, errno=%d, list=%p, listSize=%p",
+                    listPath, errno, (void*)list, (void*)listSize);
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     struct UA_DIRENT *dirent;
     while((dirent = UA_readdir(dir)) != NULL) {
@@ -196,6 +222,10 @@ readCertificates(UA_ByteString **list, size_t *listSize, const UA_String path) {
             /* Create filename to load */
             char filename[UA_PATH_MAX] = {0};
             if(mp_snprintf(filename, UA_PATH_MAX, "%s/%s", listPath, dirent->d_name) < 0) {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                            "[DIAG-readCertificates] BADINTERNALERROR: mp_snprintf failed - "
+                            "listPath=%s, dirent->d_name=%s, filename buffer size=%d",
+                            listPath, dirent->d_name, UA_PATH_MAX);
                 UA_closedir(dir);
                 return UA_STATUSCODE_BADINTERNALERROR;
             }
@@ -216,10 +246,27 @@ readCertificates(UA_ByteString **list, size_t *listSize, const UA_String path) {
 
 static UA_StatusCode
 readTrustStore(UA_CertificateGroup *certGroup, UA_TrustListDataType *trustList) {
-    if(certGroup == NULL)
+    const UA_Logger *logger = certGroup ? certGroup->logging : NULL;
+    
+    if(certGroup == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-readTrustStore] BADINTERNALERROR: certGroup is NULL - trustList=%p",
+                        (void*)trustList);
+        }
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     FileCertStore *context = (FileCertStore *)certGroup->context;
+    if(context == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-readTrustStore] BADINTERNALERROR: context is NULL - "
+                        "certGroup=%p, certGroup->context=%p, trustList=%p",
+                        (void*)certGroup, (void*)certGroup->context, (void*)trustList);
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     retval |= readCertificates(&trustList->trustedCertificates, &trustList->trustedCertificatesSize,
@@ -236,7 +283,36 @@ readTrustStore(UA_CertificateGroup *certGroup, UA_TrustListDataType *trustList) 
 
 static UA_StatusCode
 reloadAndWriteTrustStore(UA_CertificateGroup *certGroup) {
+    const UA_Logger *logger = certGroup ? certGroup->logging : NULL;
+    
+    if(certGroup == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-reloadAndWriteTrustStore] BADINTERNALERROR: certGroup is NULL");
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
     FileCertStore *context = (FileCertStore *)certGroup->context;
+    if(context == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-reloadAndWriteTrustStore] BADINTERNALERROR: context is NULL - "
+                        "certGroup=%p, certGroup->context=%p",
+                        (void*)certGroup, (void*)certGroup->context);
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
+    if(context->store == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-reloadAndWriteTrustStore] BADINTERNALERROR: context->store is NULL - "
+                        "certGroup=%p, context=%p, context->store=%p",
+                        (void*)certGroup, (void*)context, (void*)context->store);
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     UA_TrustListDataType trustList;
     UA_TrustListDataType_init(&trustList);
@@ -244,11 +320,25 @@ reloadAndWriteTrustStore(UA_CertificateGroup *certGroup) {
 
     UA_StatusCode retval = readTrustStore(certGroup, &trustList);
     if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-reloadAndWriteTrustStore] readTrustStore failed: %s - "
+                        "certGroup=%p, context=%p, context->store=%p",
+                        UA_StatusCode_name(retval),
+                        (void*)certGroup, (void*)context, (void*)context->store);
+        }
         UA_TrustListDataType_clear(&trustList);
         return retval;
     }
 
     retval = context->store->setTrustList(context->store, &trustList);
+    if(retval != UA_STATUSCODE_GOOD && logger) {
+        UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[DIAG-reloadAndWriteTrustStore] setTrustList failed: %s - "
+                    "certGroup=%p, context=%p, context->store=%p",
+                    UA_StatusCode_name(retval),
+                    (void*)certGroup, (void*)context, (void*)context->store);
+    }
     UA_TrustListDataType_clear(&trustList);
 
     return retval;
@@ -371,7 +461,7 @@ writeTrustStore(UA_CertificateGroup *certGroup, const UA_UInt32 trustListMask) {
 }
 
 static UA_StatusCode
-FileCertStore_setupStorePath(char *directory, char *rootDirectory,
+FileCertStore_setupStorePath(UA_CertificateGroup *certGroup, char *directory, char *rootDirectory,
                              size_t rootDirectorySize, UA_String *out) {
     char path[UA_PATH_MAX] = {0};
     size_t pathSize = 0;
@@ -383,24 +473,70 @@ FileCertStore_setupStorePath(char *directory, char *rootDirectory,
 
     *out = UA_STRING_ALLOC(path);
 
-    mkpath(path, 0777);
+    const UA_Logger *logger = certGroup ? certGroup->logging : NULL;
+    
+    /* Create directory recursively. mkpath() returns 0 on success, != 0 on failure */
+    int mkpathResult = mkpath(path, 0777);
+    if(mkpathResult != 0) {
+        /* Check if directory was created by another thread/process (race condition) */
+        struct UA_STAT sb;
+        if(UA_stat(path, &sb) == 0) {
+            /* Directory exists now - treat as success (idempotent behavior) */
+            return UA_STATUSCODE_GOOD;
+        }
+        
+        /* Real failure - log error and return error code */
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create PKI directory: %s (errno=%d, mkpath_result=%d)",
+                        path, errno, mkpathResult);
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
     return UA_STATUSCODE_GOOD;
 }
 
 static UA_StatusCode
 FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String directory) {
-    if(certGroup == NULL)
+    const UA_Logger *logger = certGroup ? certGroup->logging : NULL;
+    
+    if(certGroup == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-FileCertStore_createPkiDirectory] BADINTERNALERROR: certGroup is NULL - "
+                        "directory.length=%zu, directory.data=%p",
+                        directory.length, (void*)directory.data);
+        }
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     FileCertStore *context = (FileCertStore *)certGroup->context;
-    if(!context)
+    if(!context) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-FileCertStore_createPkiDirectory] BADINTERNALERROR: context is NULL - "
+                        "certGroup=%p, certGroup->context=%p, directory.length=%zu, directory.data=%.*s",
+                        (void*)certGroup, (void*)certGroup->context,
+                        directory.length, (int)directory.length, directory.data);
+        }
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     char rootDirectory[UA_PATH_MAX] = {0};
     size_t rootDirectorySize = 0;
 
-    if(directory.length <= 0 || directory.length >= UA_PATH_MAX)
+    if(directory.length <= 0 || directory.length >= UA_PATH_MAX) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-FileCertStore_createPkiDirectory] BADINTERNALERROR: invalid directory length - "
+                        "certGroup=%p, context=%p, directory.length=%zu (must be >0 and <%d), directory.data=%.*s",
+                        (void*)certGroup, (void*)context,
+                        directory.length, UA_PATH_MAX,
+                        (int)(directory.length < 100 ? directory.length : 100), directory.data);
+        }
         return UA_STATUSCODE_BADINTERNALERROR;
+    }
 
     memcpy(rootDirectory, directory.data, directory.length);
     rootDirectorySize = strnlen(rootDirectory, UA_PATH_MAX);
@@ -430,21 +566,119 @@ FileCertStore_createPkiDirectory(UA_CertificateGroup *certGroup, const UA_String
 
     context->rootFolder = UA_STRING_ALLOC(rootDirectory);
 
+    /* Create parent directories explicitly before creating subdirectories */
+    /* This ensures that paths like ./server_pki/ApplCerts/rejected exist before creating rejected/certs */
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
-    retval |= FileCertStore_setupStorePath("/trusted/certs", rootDirectory,
+    
+    /* Step 1: Create the root certificate group directory (e.g., ./server_pki/ApplCerts) */
+    int mkpathResult = mkpath(rootDirectory, 0777);
+    if(mkpathResult != 0) {
+        /* Check for race condition: directory might have been created by another thread/process */
+        struct UA_STAT sb;
+        if(UA_stat(rootDirectory, &sb) != 0) {
+            /* Real failure - log error */
+            if(logger) {
+                UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                            "[FILESTORE] Failed to create root certificate group directory: %s (errno=%d, mkpath_result=%d)",
+                            rootDirectory, errno, mkpathResult);
+            }
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+    }
+    
+    /* Step 2: Create parent directories for each subdirectory category */
+    char parentDir[UA_PATH_MAX] = {0};
+    const char *parentDirs[] = {"/rejected", "/own", "/trusted", "/issuer"};
+    size_t numParentDirs = sizeof(parentDirs) / sizeof(parentDirs[0]);
+    
+    for(size_t i = 0; i < numParentDirs; i++) {
+        mp_snprintf(parentDir, UA_PATH_MAX, "%s%s", rootDirectory, parentDirs[i]);
+        mkpathResult = mkpath(parentDir, 0777);
+        if(mkpathResult != 0) {
+            /* Check for race condition */
+            struct UA_STAT sb;
+            if(UA_stat(parentDir, &sb) != 0) {
+                /* Real failure - log error */
+                if(logger) {
+                    UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                                "[FILESTORE] Failed to create parent directory: %s (errno=%d, mkpath_result=%d)",
+                                parentDir, errno, mkpathResult);
+                }
+                return UA_STATUSCODE_BADINTERNALERROR;
+            }
+        }
+    }
+    
+    /* Step 3: Now create subdirectories (certs, crl, private) */
+    retval |= FileCertStore_setupStorePath(certGroup, "/trusted/certs", rootDirectory,
                                            rootDirectorySize, &context->trustedCertFolder);
-    retval |= FileCertStore_setupStorePath("/trusted/crl", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create trusted/certs directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/trusted/crl", rootDirectory,
                                            rootDirectorySize, &context->trustedCrlFolder);
-    retval |= FileCertStore_setupStorePath("/issuer/certs", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create trusted/crl directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/issuer/certs", rootDirectory,
                                            rootDirectorySize, &context->issuerCertFolder);
-    retval |= FileCertStore_setupStorePath("/issuer/crl", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create issuer/certs directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/issuer/crl", rootDirectory,
                                            rootDirectorySize, &context->issuerCrlFolder);
-    retval |= FileCertStore_setupStorePath("/rejected/certs", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create issuer/crl directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/rejected/certs", rootDirectory,
                                            rootDirectorySize, &context->rejectedCertFolder);
-    retval |= FileCertStore_setupStorePath("/own/certs", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create rejected/certs directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/own/certs", rootDirectory,
                                            rootDirectorySize, &context->ownCertFolder);
-    retval |= FileCertStore_setupStorePath("/own/private", rootDirectory,
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create own/certs directory");
+        }
+        return retval;
+    }
+    
+    retval |= FileCertStore_setupStorePath(certGroup, "/own/private", rootDirectory,
                                            rootDirectorySize, &context->ownKeyFolder);
+    if(retval != UA_STATUSCODE_GOOD) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE] Failed to create own/private directory");
+        }
+        return retval;
+    }
 
     return retval;
 }
@@ -485,6 +719,49 @@ FileCertStore_createInotifyEvent(UA_CertificateGroup *certGroup) {
 }
 
 #endif /* __linux__ */
+
+/* Ensure that the rejected certificates directory exists before writing */
+static UA_StatusCode
+ensureRejectedDirectoryExists(UA_CertificateGroup *certGroup, const UA_String *rejectedCertFolder) {
+    if(certGroup == NULL || rejectedCertFolder == NULL || rejectedCertFolder->length == 0)
+        return UA_STATUSCODE_BADINTERNALERROR;
+    
+    const UA_Logger *logger = certGroup->logging;
+    char dirPath[UA_PATH_MAX] = {0};
+    mp_snprintf(dirPath, UA_PATH_MAX, "%.*s", (int)rejectedCertFolder->length, (char *)rejectedCertFolder->data);
+    
+    /* Check if directory already exists */
+    struct UA_STAT sb;
+    if(UA_stat(dirPath, &sb) == 0) {
+        /* Directory exists - success */
+        return UA_STATUSCODE_GOOD;
+    }
+    
+    /* Directory doesn't exist - create it recursively */
+    int mkpathResult = mkpath(dirPath, 0777);
+    if(mkpathResult != 0) {
+        /* Check for race condition: directory might have been created by another thread/process */
+        if(UA_stat(dirPath, &sb) == 0) {
+            /* Directory exists now - treat as success (idempotent behavior) */
+            return UA_STATUSCODE_GOOD;
+        }
+        
+        /* Real failure - log error */
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE-REJECTED] Failed to create rejected/certs directory: %s (errno=%d, mkpath_result=%d)",
+                        dirPath, errno, mkpathResult);
+        }
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
+    /* Directory created successfully */
+    if(logger) {
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-REJECTED] Created rejected/certs directory: %s", dirPath);
+    }
+    return UA_STATUSCODE_GOOD;
+}
 
 static UA_StatusCode
 FileCertStore_getTrustList(UA_CertificateGroup *certGroup, UA_TrustListDataType *trustList) {
@@ -601,6 +878,66 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
                     (int)context->trustedCertFolder.length, context->trustedCertFolder.data);
     }
     
+    /* PQC signature verification: If certificate is PQC-signed, verify signature first */
+    UA_Boolean isPQCSigned = UA_PQC_IsCertificatePQCSigned(certificate, certGroup->logging);
+    if(isPQCSigned) {
+        if(certGroup->logging) {
+            UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[FILESTORE-PQC] Certificate is PQC-signed, verifying signature...");
+        }
+        
+        UA_StatusCode pqcVerifyResult = UA_PQC_VerifyCertificateSignature(certificate);
+        if(pqcVerifyResult != UA_STATUSCODE_GOOD) {
+            if(certGroup->logging) {
+                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                              "[FILESTORE-PQC] PQC signature verification FAILED: %s",
+                              UA_StatusCode_name(pqcVerifyResult));
+            }
+            
+            /* Write certificate to rejected/ directory */
+            /* Ensure rejected directory exists before writing */
+            UA_StatusCode dirResult = ensureRejectedDirectoryExists(certGroup, &context->rejectedCertFolder);
+            if(dirResult == UA_STATUSCODE_GOOD) {
+                char filename[UA_PATH_MAX] = {0};
+                UA_StatusCode filenameResult = getCertFileName((char*)context->rejectedCertFolder.data, certificate, filename, UA_PATH_MAX);
+                if(filenameResult == UA_STATUSCODE_GOOD) {
+                    if(access(filename, F_OK) != 0) {
+                        UA_StatusCode writeResult = writeByteStringToFile(filename, certificate);
+                        if(writeResult == UA_STATUSCODE_GOOD) {
+                            if(certGroup->logging) {
+                                UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                           "[FILESTORE-PQC-REJECTED] Certificate with invalid PQC signature written to rejected/: %s",
+                                           filename);
+                            }
+                        } else {
+                            /* Log error but don't change verification result */
+                            if(certGroup->logging) {
+                                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                              "[FILESTORE-PQC-REJECTED] Failed to write rejected certificate to %s: %s",
+                                              filename, UA_StatusCode_name(writeResult));
+                            }
+                        }
+                    }
+                }
+            } else {
+                /* Log error but don't change verification result */
+                if(certGroup->logging) {
+                    UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                  "[FILESTORE-PQC-REJECTED] Failed to ensure rejected/certs directory exists: %s",
+                                  UA_StatusCode_name(dirResult));
+                }
+            }
+            
+            /* Abort verification - PQC signature is invalid */
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        } else {
+            if(certGroup->logging) {
+                UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "[FILESTORE-PQC] PQC signature verification SUCCEEDED");
+            }
+        }
+    }
+    
     /* It will only re-read the Cert store on the file system if there have been changes to files. */
     UA_StatusCode retval = reloadTrustStore(certGroup);
     if(retval != UA_STATUSCODE_GOOD) {
@@ -630,19 +967,39 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
 
     /* If certificate is not in trusted, save it to rejected directory */
     if(!isInTrusted) {
-        char filename[UA_PATH_MAX] = {0};
-        retval = getCertFileName((char*)context->rejectedCertFolder.data, certificate, filename, UA_PATH_MAX);
-        if(retval == UA_STATUSCODE_GOOD) {
-            /* Check if certificate already exists in rejected */
-            if(access(filename, F_OK) != 0) {
-                /* Save certificate to rejected directory */
-                retval = writeByteStringToFile(filename, certificate);
-                if(retval == UA_STATUSCODE_GOOD && certGroup->logging) {
-                    UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
-                               "[FILESTORE-REJECTED] Certificate written to rejected/: %s "
-                               "(Administrator must manually move to trusted directory to trust it)",
-                               filename);
+        /* Ensure rejected directory exists before writing */
+        UA_StatusCode dirResult = ensureRejectedDirectoryExists(certGroup, &context->rejectedCertFolder);
+        if(dirResult == UA_STATUSCODE_GOOD) {
+            char filename[UA_PATH_MAX] = {0};
+            UA_StatusCode filenameResult = getCertFileName((char*)context->rejectedCertFolder.data, certificate, filename, UA_PATH_MAX);
+            if(filenameResult == UA_STATUSCODE_GOOD) {
+                /* Check if certificate already exists in rejected */
+                if(access(filename, F_OK) != 0) {
+                    /* Save certificate to rejected directory */
+                    UA_StatusCode writeResult = writeByteStringToFile(filename, certificate);
+                    if(writeResult == UA_STATUSCODE_GOOD) {
+                        if(certGroup->logging) {
+                            UA_LOG_INFO(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                       "[FILESTORE-REJECTED] Certificate written to rejected/: %s "
+                                       "(Administrator must manually move to trusted directory to trust it)",
+                                       filename);
+                        }
+                    } else {
+                        /* Log error but don't change verification result */
+                        if(certGroup->logging) {
+                            UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                          "[FILESTORE-REJECTED] Failed to write rejected certificate to %s: %s",
+                                          filename, UA_StatusCode_name(writeResult));
+                        }
+                    }
                 }
+            }
+        } else {
+            /* Log error but don't change verification result */
+            if(certGroup->logging) {
+                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                              "[FILESTORE-REJECTED] Failed to ensure rejected/certs directory exists: %s",
+                              UA_StatusCode_name(dirResult));
             }
         }
     }
@@ -653,12 +1010,31 @@ FileCertStore_verifyCertificate(UA_CertificateGroup *certGroup, const UA_ByteStr
        retval == UA_STATUSCODE_BADCERTIFICATEUSENOTALLOWED ||
        retval == UA_STATUSCODE_BADCERTIFICATEREVOCATIONUNKNOWN ||
        retval == UA_STATUSCODE_BADCERTIFICATEISSUERREVOCATIONUNKNOWN) {
-        /* write rejectedList to filestore */
-        UA_ByteString *rejectedList = NULL;
-        size_t rejectedListSize = 0;
-        context->store->getRejectedList(context->store, &rejectedList, &rejectedListSize);
-        writeTrustList(certGroup, rejectedList, rejectedListSize, context->rejectedCertFolder);
-        UA_Array_delete(rejectedList, rejectedListSize, &UA_TYPES[UA_TYPES_BYTESTRING]);
+        /* Ensure rejected directory exists before writing rejectedList */
+        UA_StatusCode dirResult = ensureRejectedDirectoryExists(certGroup, &context->rejectedCertFolder);
+        if(dirResult == UA_STATUSCODE_GOOD) {
+            /* write rejectedList to filestore */
+            UA_ByteString *rejectedList = NULL;
+            size_t rejectedListSize = 0;
+            context->store->getRejectedList(context->store, &rejectedList, &rejectedListSize);
+            UA_StatusCode writeResult = writeTrustList(certGroup, rejectedList, rejectedListSize, context->rejectedCertFolder);
+            if(writeResult != UA_STATUSCODE_GOOD) {
+                /* Log error but don't change verification result */
+                if(certGroup->logging) {
+                    UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                                  "[FILESTORE-REJECTED] Failed to write rejected list to filestore: %s",
+                                  UA_StatusCode_name(writeResult));
+                }
+            }
+            UA_Array_delete(rejectedList, rejectedListSize, &UA_TYPES[UA_TYPES_BYTESTRING]);
+        } else {
+            /* Log error but don't change verification result */
+            if(certGroup->logging) {
+                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                              "[FILESTORE-REJECTED] Failed to ensure rejected/certs directory exists before writing rejected list: %s",
+                              UA_StatusCode_name(dirResult));
+            }
+        }
     }
 
     return retval;
@@ -703,6 +1079,13 @@ UA_CertificateGroup_Filestore(UA_CertificateGroup *certGroup,
                               const UA_Logger *logger,
                               const UA_KeyValueMap *params) {
     if(certGroup == NULL || certificateGroupId == NULL) {
+        if(logger) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "[DIAG-UA_CertificateGroup_Filestore] BADINTERNALERROR: NULL parameter - "
+                        "certGroup=%p, certificateGroupId=%p, storePath.length=%zu, storePath.data=%p",
+                        (void*)certGroup, (void*)certificateGroupId,
+                        storePath.length, (void*)storePath.data);
+        }
         return UA_STATUSCODE_BADINTERNALERROR;
     }
 

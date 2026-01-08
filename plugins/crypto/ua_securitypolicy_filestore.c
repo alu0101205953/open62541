@@ -14,7 +14,7 @@
 
 #ifdef UA_ENABLE_ENCRYPTION
 
-#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32)
+#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
 
 typedef struct {
     /* In-Memory security policy as a base */
@@ -344,6 +344,6 @@ UA_SecurityPolicy_Filestore(UA_SecurityPolicy *policy,
     return retval;
 }
 
-#endif /* defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) */
+#endif /* defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) */
 
 #endif /* UA_ENABLE_ENCRYPTION */

@@ -47,6 +47,79 @@ static bool fileExists(const char *path) {
     return (access(path, F_OK) == 0);
 }
 
+/* Ensure directory exists, creating it recursively if needed */
+/* This function is identical to the one in server_encryption.c */
+static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
+    if(!dirPath) {
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+    
+    /* Check if directory already exists */
+    struct stat st;
+    if(stat(dirPath, &st) == 0) {
+        if(S_ISDIR(st.st_mode)) {
+            /* Directory exists */
+            return UA_STATUSCODE_GOOD;
+        } else {
+            /* Path exists but is not a directory */
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "[FILESTORE] Path exists but is not a directory: %s", dirPath);
+            return UA_STATUSCODE_BADINTERNALERROR;
+        }
+    }
+    
+    /* Directory doesn't exist, create it recursively */
+    /* Extract parent directory */
+    char parentPath[4096] = {0};
+    strncpy(parentPath, dirPath, sizeof(parentPath) - 1);
+    char *lastSlash = strrchr(parentPath, '/');
+    #ifdef UA_ARCHITECTURE_WIN32
+    if(!lastSlash) {
+        lastSlash = strrchr(parentPath, '\\');
+    }
+    #endif
+    
+    if(lastSlash) {
+        *lastSlash = '\0';
+        /* Recursively ensure parent directory exists */
+        UA_StatusCode parentStatus = ensureDirectoryExists(parentPath);
+        if(parentStatus != UA_STATUSCODE_GOOD) {
+            return parentStatus;
+        }
+    }
+    
+    /* Create the directory */
+    #ifdef UA_ARCHITECTURE_WIN32
+    if(_mkdir(dirPath) != 0) {
+        if(errno == EEXIST) {
+            /* Directory was created by another process, verify it exists */
+            if(stat(dirPath, &st) == 0 && S_ISDIR(st.st_mode)) {
+                return UA_STATUSCODE_GOOD;
+            }
+        }
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create directory %s: errno=%d", dirPath, errno);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    #else
+    if(mkdir(dirPath, 0777) != 0) {
+        if(errno == EEXIST) {
+            /* Directory was created by another process, verify it exists */
+            if(stat(dirPath, &st) == 0 && S_ISDIR(st.st_mode)) {
+                return UA_STATUSCODE_GOOD;
+            }
+        }
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create directory %s: errno=%d", dirPath, errno);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    #endif
+    
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+               "[FILESTORE] Created PKI directory: %s", dirPath);
+    return UA_STATUSCODE_GOOD;
+}
+
 int main(int argc, char* argv[]) {
     /* Ignore SIGPIPE to prevent broken pipe errors when output is redirected to pipes */
     signal(SIGPIPE, SIG_IGN);
@@ -56,58 +129,83 @@ int main(int argc, char* argv[]) {
     UA_String clientStorePath = UA_STRING_NULL;
     char *endpointUrl = NULL;
     char *serverCertFile = NULL;
+    char *pkiPathArg = NULL;
 
     if(argc < MIN_ARGS) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Arguments missing. Required arguments are: "
-                     "<opc.tcp://host:port> [<path/to/pki/folder>]");
+                     "<opc.tcp://host:port> [--pki <path/to/pki/folder>]");
         return EXIT_FAILURE;
     }
 
     endpointUrl = argv[1];
 
-    /* Determine PKI store path - use command line argument or default to current directory */
-    if(argc >= 3) {
-        clientStorePath = UA_STRING(argv[2]);
-    } else {
-        char storePathDir[4096];
-        if(!getcwd(storePathDir, sizeof(storePathDir))) {
+    /* Parse command line options */
+    for(int argpos = 2; argpos < argc; argpos++) {
+        if(strcmp(argv[argpos], "--pki") == 0 && argpos + 1 < argc) {
+            pkiPathArg = argv[++argpos];
+            continue;
+        }
+        if(strcmp(argv[argpos], "--serverCert") == 0 && argpos + 1 < argc) {
+            serverCertFile = argv[++argpos];
+            continue;
+        }
+    }
+
+    /* Determine PKI store path - use --pki argument or default to ./client_pki */
+    if(pkiPathArg) {
+        /* Defensive validation: reject paths that start with -- */
+        if(strlen(pkiPathArg) >= 2 && pkiPathArg[0] == '-' && pkiPathArg[1] == '-') {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                         "Can't retrieve current working directory.");
+                         "Invalid PKI path: path cannot start with '--' (got: %s). "
+                         "Use --pki <path> to specify PKI directory.",
+                         pkiPathArg);
             return EXIT_FAILURE;
         }
-        clientStorePath = UA_STRING(storePathDir);
+        clientStorePath = UA_STRING(pkiPathArg);
+    } else {
+        /* Default to ./client_pki in current directory */
+        clientStorePath = UA_String_fromChars("./client_pki");
+        if(clientStorePath.length == 0) {
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                         "Failed to allocate default PKI path");
+            return EXIT_FAILURE;
+        }
     }
 
     /* Build paths to own certificate and private key in PKI */
-    char certDir[4096], keyDir[4096];
-    snprintf(certDir, sizeof(certDir), "%.*s/own/certs",
-             (int)clientStorePath.length, clientStorePath.data);
-    snprintf(keyDir, sizeof(keyDir), "%.*s/own/private",
-             (int)clientStorePath.length, clientStorePath.data);
-    
+    /* Standard PKI structure: {storePath}/ApplCerts/own/{certs,private} */
     char certPath[4096], keyPath[4096];
-    snprintf(certPath, sizeof(certPath), "%s/client_cert.der", certDir);
-    snprintf(keyPath, sizeof(keyPath), "%s/client_key.der", keyDir);
+    snprintf(certPath, sizeof(certPath), "%.*s/ApplCerts/own/certs/client_cert.der",
+             (int)clientStorePath.length, clientStorePath.data);
+    snprintf(keyPath, sizeof(keyPath), "%.*s/ApplCerts/own/private/client_key.der",
+             (int)clientStorePath.length, clientStorePath.data);
     
-    /* Load certificate and private key from PKI FileStore */
+    /* Try to load certificate and private key from PKI FileStore FIRST */
+    UA_Boolean loadedFromPKI = false;
     if(fileExists(certPath) && fileExists(keyPath)) {
         certificate = loadFile(certPath);
         privateKey = loadFile(keyPath);
         
         /* Validate that files were loaded successfully */
-        if(certificate.length == 0 || privateKey.length == 0) {
-            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Failed to load certificate or private key from PKI FileStore.");
+        if(certificate.length > 0 && privateKey.length > 0) {
+            loadedFromPKI = true;
+            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                       "[FILESTORE] Loaded client certificate and key from PKI own/: %s", certPath);
+        } else {
+            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                           "Failed to load certificate or private key from PKI FileStore (files exist but are empty or invalid).");
             if(certificate.length > 0)
                 UA_ByteString_clear(&certificate);
             if(privateKey.length > 0)
                 UA_ByteString_clear(&privateKey);
-            return EXIT_FAILURE;
+            certificate = UA_BYTESTRING_NULL;
+            privateKey = UA_BYTESTRING_NULL;
         }
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                    "Loaded certificate and private key from PKI FileStore: %s", certPath);
-    } else {
+    }
+    
+    /* Generate PQC certificate if not loaded from PKI */
+    if(!loadedFromPKI) {
         /* Generate PQC certificate directly (requires OpenSSL 3.0+ and OQS Provider) */
         UA_String subject[3] = {UA_STRING_STATIC("C=DE"),
                             UA_STRING_STATIC("O=SampleOrganization"),
@@ -142,17 +240,6 @@ int main(int argc, char* argv[]) {
         endpointUrl = "opc.tcp://localhost:4840";
     }
 
-    /* If the server certificate is specified, a direct endpoint is created in the client configuration. */
-    for(int argpos = 1; argpos < argc; argpos++) {
-        if(strcmp(argv[argpos], "--serverCert") == 0) {
-            argpos++;
-            if(argpos < argc) {
-            serverCertFile = argv[argpos];
-            }
-            break;
-        }
-    }
-
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
     if(certificate.length > 0 && privateKey.length > 0) {
         UA_Boolean certIsPQCSigned = UA_PQC_IsCertificatePQCSigned(&certificate, UA_Log_Stdout);
@@ -169,19 +256,19 @@ int main(int argc, char* argv[]) {
         }
             
         /* Save auto-generated certificates AFTER ensuring PQC extensions */
-            /* Check if certificates were auto-generated (no arguments provided) */
-        if(argc < MIN_ARGS && certificate.length > 0 && privateKey.length > 0) {
-                const char *defaultCertPath = "client_cert_pqc.der";
-                const char *defaultKeyPath = "client_key_pqc.der";
-                
+        /* Only save if not loaded from PKI */
+        if(!loadedFromPKI && certificate.length > 0 && privateKey.length > 0) {
+            const char *defaultCertPath = "client_cert_pqc.der";
+            const char *defaultKeyPath = "client_key_pqc.der";
+            
             UA_StatusCode certWriteStatus = writeFile(defaultCertPath, certificate);
             UA_StatusCode keyWriteStatus = writeFile(defaultKeyPath, privateKey);
             if(certWriteStatus != UA_STATUSCODE_GOOD || keyWriteStatus != UA_STATUSCODE_GOOD) {
                 UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                               "Failed to save auto-generated certificate files to disk.");
             }
-                }
-            }
+        }
+    }
     
     if(serverCertFile) {
         UA_ByteString serverCert = loadFile(serverCertFile);
@@ -230,6 +317,59 @@ int main(int argc, char* argv[]) {
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
+
+    /* Log PKI initialization */
+    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                "[FILESTORE] PKI initialized at %.*s",
+                (int)clientStorePath.length, clientStorePath.data);
+
+    /* Ensure all PKI directories exist physically on disk */
+    /* This uses the same logic as the server to create the complete PKI tree */
+    /* Access FileCertStore context structures to get all directory paths */
+    typedef struct {
+        UA_CertificateGroup *store;
+        #ifdef __linux__
+        int inotifyFd;
+        #endif
+        UA_String trustedCertFolder;
+        UA_String trustedCrlFolder;
+        UA_String issuerCertFolder;
+        UA_String issuerCrlFolder;
+        UA_String rejectedCertFolder;
+        UA_String ownCertFolder;
+        UA_String ownKeyFolder;
+        UA_String rootFolder;
+    } FileCertStore;
+    
+    /* Helper macro to create directory from UA_String */
+    char dirPath[4096] = {0};
+    #define CREATE_DIR_FROM_STRING(str) do { \
+        if((str).length > 0) { \
+            snprintf(dirPath, sizeof(dirPath), "%.*s", \
+                     (int)(str).length, (char*)(str).data); \
+            UA_StatusCode dirStatus = ensureDirectoryExists(dirPath); \
+            if(dirStatus != UA_STATUSCODE_GOOD) { \
+                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, \
+                              "[FILESTORE] Failed to create directory: %s", dirPath); \
+            } \
+        } \
+    } while(0)
+    
+    /* Create all directories for Application Certificates (certificateVerification) */
+    /* The client uses certificateVerification instead of secureChannelPKI */
+    if(cc->certificateVerification.context) {
+        FileCertStore *applContext = (FileCertStore *)cc->certificateVerification.context;
+        
+        CREATE_DIR_FROM_STRING(applContext->trustedCertFolder);
+        CREATE_DIR_FROM_STRING(applContext->trustedCrlFolder);
+        CREATE_DIR_FROM_STRING(applContext->issuerCertFolder);
+        CREATE_DIR_FROM_STRING(applContext->issuerCrlFolder);
+        CREATE_DIR_FROM_STRING(applContext->rejectedCertFolder);
+        CREATE_DIR_FROM_STRING(applContext->ownCertFolder);
+        CREATE_DIR_FROM_STRING(applContext->ownKeyFolder);
+    }
+    
+    #undef CREATE_DIR_FROM_STRING
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
     /* Replace default policy with PQC with filestore support */
@@ -349,9 +489,7 @@ int main(int argc, char* argv[]) {
             UA_Client_delete(client);
             UA_ByteString_clear(&certificate);
             UA_ByteString_clear(&privateKey);
-            for(size_t i = 0; i < trustListSize; i++) {
-                UA_ByteString_clear(&trustList[i]);
-            }
+            UA_String_clear(&clientStorePath);
             return EXIT_FAILURE;
         }
         cc->endpoint.userIdentityTokensSize = 1;

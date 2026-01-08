@@ -86,6 +86,9 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
     if(UA_String_equal(&securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI))
         channel->securityMode = UA_MESSAGESECURITYMODE_NONE;
 
+    /* Initialize channel->remoteCertificate first to ensure it's always in a valid state */
+    UA_ByteString_init(&channel->remoteCertificate);
+    
     UA_StatusCode res = securityPolicy->channelModule.
         newContext(securityPolicy, certForContext, &channel->channelContext);
     
@@ -95,12 +98,18 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
                 UA_StatusCode_name(res),
                 (void*)channel->channelContext);
     
+    /* If newContext failed, cleanup and return early */
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_ByteString_clear(&channel->remoteCertificate);
+        return res;
+    }
+    
+    /* Copy remote certificate to channel (ownership: channel owns this copy) */
     if(allowEmptyCert) {
-        UA_ByteString_init(&channel->remoteCertificate);
         UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
-                    "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: allowEmptyCert=true, initialized empty certificate");
+                    "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: allowEmptyCert=true, keeping empty certificate");
     } else {
-        res |= UA_ByteString_copy(remoteCertificate, &channel->remoteCertificate);
+        res = UA_ByteString_copy(remoteCertificate, &channel->remoteCertificate);
         UA_LOG_INFO(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: After ByteString_copy. "
                     "res=%s remoteCertificate.length=%zu",
@@ -109,13 +118,17 @@ UA_SecureChannel_setSecurityPolicy(UA_SecureChannel *channel,
         if(res != UA_STATUSCODE_GOOD) {
             UA_LOG_ERROR(securityPolicy->logger, UA_LOGCATEGORY_SECURITYPOLICY,
                         "[TRACE-POLICY] UA_SecureChannel_setSecurityPolicy: ERROR - ByteString_copy failed. "
-                        "res=%s channel.securityPolicy=%p (NOT SET - returning early)",
+                        "res=%s channel.securityPolicy=%p (NOT SET - cleaning up and returning)",
                         UA_StatusCode_name(res),
                         (void*)channel->securityPolicy);
+            /* Cleanup: delete context and clear remoteCertificate before returning */
+            if(channel->channelContext) {
+                securityPolicy->channelModule.deleteContext(channel->channelContext);
+                channel->channelContext = NULL;
+            }
+            UA_ByteString_clear(&channel->remoteCertificate);
+            return res;
         }
-        UA_CHECK_STATUS_WARN(res, return res, securityPolicy->logger,
-                             UA_LOGCATEGORY_SECURITYPOLICY,
-                             "Could not set up the SecureChannel context");
     }
 
     /* Compute the certificate thumbprint */
@@ -254,7 +267,10 @@ UA_SecureChannel_clear(UA_SecureChannel *channel) {
     /* No sessions must be attached to this any longer */
     UA_assert(channel->sessions == NULL);
 
-    /* Delete the channel context for the security policy */
+    /* Clean up certificate FIRST (channel owns this copy, independent of channelContext) */
+    UA_ByteString_clear(&channel->remoteCertificate);
+
+    /* Delete the channel context for the security policy (context owns its own copy of remoteCertificate) */
     if(channel->securityPolicy) {
         channel->securityPolicy->channelModule.deleteContext(channel->channelContext);
         channel->securityPolicy = NULL;
@@ -276,8 +292,7 @@ UA_SecureChannel_clear(UA_SecureChannel *channel) {
     UA_ChannelSecurityToken_clear(&channel->securityToken);
     UA_ChannelSecurityToken_clear(&channel->altSecurityToken);
 
-    /* Clean up certificate and nonces */
-    UA_ByteString_clear(&channel->remoteCertificate);
+    /* Clean up nonces */
     UA_ByteString_clear(&channel->localNonce);
     UA_ByteString_clear(&channel->remoteNonce);
 

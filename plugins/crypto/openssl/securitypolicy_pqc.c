@@ -1637,6 +1637,43 @@ UA_PQC_HasCertificatePQCExtensions(const UA_ByteString *certificate, const UA_Lo
     return hasPQCExtensions;
 }
 
+UA_EXPORT UA_StatusCode
+UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate) {
+    if(!certificate || certificate->length == 0 || !certificate->data)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    UA_Boolean certWasPem = UA_FALSE;
+    X509 *x509 = pqc_parse_x509_from_bytes(certificate, &certWasPem);
+    if(!x509) {
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    }
+
+    /* Get the public key from the certificate */
+    EVP_PKEY *pubkey = X509_get_pubkey(x509);
+    if(!pubkey) {
+        X509_free(x509);
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    }
+
+    /* Verify the certificate signature using the certificate's own public key
+     * This works with OQS Provider if the certificate is PQC-signed */
+    int verifyResult = X509_verify(x509, pubkey);
+    
+    EVP_PKEY_free(pubkey);
+    X509_free(x509);
+
+    if(verifyResult == 1) {
+        /* Signature is valid */
+        return UA_STATUSCODE_GOOD;
+    } else if(verifyResult == 0) {
+        /* Signature verification failed */
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    } else {
+        /* Error during verification */
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    }
+}
+
 /* ---------------------- Create CSR with PQC keys -------------------- */
 UA_EXPORT UA_StatusCode
 UA_PQC_CreateCSR(const UA_Logger *logger,
