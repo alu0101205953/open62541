@@ -130,6 +130,154 @@ static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
     return UA_STATUSCODE_GOOD;
 }
 
+/* Ensure PKI structure exists and server certificate is available */
+/* This function MUST be called BEFORE UA_ServerConfig_setDefaultWithFilestore or UA_ServerConfig_setDefaultWithSecurityPolicies */
+static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
+    if(!storePath || !storePath->data || storePath->length == 0) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Invalid storePath in ensurePKIAndServerCertificate");
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+    
+    /* Build paths to PKI structure */
+    char rootDir[4096];
+    char applCertsDir[4096];
+    char ownCertsDir[4096];
+    char ownPrivateDir[4096];
+    char trustedDir[4096];
+    char rejectedDir[4096];
+    char certPath[4096];
+    char keyPath[4096];
+    
+    snprintf(rootDir, sizeof(rootDir), "%.*s", (int)storePath->length, storePath->data);
+    snprintf(applCertsDir, sizeof(applCertsDir), "%.*s/ApplCerts", (int)storePath->length, storePath->data);
+    snprintf(ownCertsDir, sizeof(ownCertsDir), "%.*s/ApplCerts/own/certs", (int)storePath->length, storePath->data);
+    snprintf(ownPrivateDir, sizeof(ownPrivateDir), "%.*s/ApplCerts/own/private", (int)storePath->length, storePath->data);
+    snprintf(trustedDir, sizeof(trustedDir), "%.*s/ApplCerts/trusted", (int)storePath->length, storePath->data);
+    snprintf(certPath, sizeof(certPath), "%.*s/ApplCerts/own/certs/server_cert.der", (int)storePath->length, storePath->data);
+    snprintf(keyPath, sizeof(keyPath), "%.*s/ApplCerts/own/private/server_key.der", (int)storePath->length, storePath->data);
+    
+    /* Step 1: Create PKI directory structure */
+    UA_StatusCode retval = ensureDirectoryExists(rootDir);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create root PKI directory: %s", rootDir);
+        return retval;
+    }
+    
+    retval = ensureDirectoryExists(applCertsDir);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create ApplCerts directory: %s", applCertsDir);
+        return retval;
+    }
+    
+    retval = ensureDirectoryExists(ownCertsDir);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create own/certs directory: %s", ownCertsDir);
+        return retval;
+    }
+    
+    retval = ensureDirectoryExists(ownPrivateDir);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create own/private directory: %s", ownPrivateDir);
+        return retval;
+    }
+    
+    retval = ensureDirectoryExists(trustedDir);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Failed to create trusted directory: %s", trustedDir);
+        return retval;
+    }
+    
+    /* Step 2: Check if server certificate and key exist */
+    bool certExists = fileExists(certPath);
+    bool keyExists = fileExists(keyPath);
+    
+    if(certExists && keyExists) {
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "[FILESTORE] Server certificate and key already exist in PKI: %s", certPath);
+        return UA_STATUSCODE_GOOD;
+    }
+    
+    /* Step 3: Generate server certificate if missing */
+    if(!certExists || !keyExists) {
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "[FILESTORE] Server certificate or key missing. Generating self-signed PQC certificate...");
+        
+        UA_ByteString certificate = UA_BYTESTRING_NULL;
+        UA_ByteString privateKey = UA_BYTESTRING_NULL;
+        
+        UA_String subject[3] = {
+            UA_STRING_STATIC("C=DE"),
+            UA_STRING_STATIC("O=SampleOrganization"),
+            UA_STRING_STATIC("CN=Open62541Server@localhost")
+        };
+        UA_UInt32 lenSubject = 3;
+        
+        UA_String subjectAltName[2] = {
+            UA_STRING_STATIC("DNS:localhost"),
+            UA_STRING_STATIC("URI:urn:open62541.server.application")
+        };
+        UA_UInt32 lenSubjectAltName = 2;
+        
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+        UA_StatusCode certGenStatus = UA_PQC_CreateCertificate(
+            UA_Log_Stdout, subject, lenSubject, subjectAltName, lenSubjectAltName,
+            UA_CERTIFICATEFORMAT_DER,
+            0,   /* rsaKeySizeBits - deprecated, ignored */
+            365, /* expiresInDays */
+            &privateKey,
+            &certificate);
+        
+        if(certGenStatus != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "[FILESTORE] Failed to generate server certificate: %s",
+                        UA_StatusCode_name(certGenStatus));
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            return certGenStatus;
+        }
+        
+        /* Step 4: Write certificate and key to PKI */
+        UA_StatusCode certWriteStatus = writeFile(certPath, certificate);
+        if(certWriteStatus != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "[FILESTORE] Failed to write server certificate to: %s", certPath);
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            return certWriteStatus;
+        }
+        
+        UA_StatusCode keyWriteStatus = writeFile(keyPath, privateKey);
+        if(keyWriteStatus != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                        "[FILESTORE] Failed to write server private key to: %s", keyPath);
+            UA_ByteString_clear(&certificate);
+            UA_ByteString_clear(&privateKey);
+            return keyWriteStatus;
+        }
+        
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "[FILESTORE] Generated and saved server certificate to: %s", certPath);
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "[FILESTORE] Generated and saved server private key to: %s", keyPath);
+        
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+#else
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "[FILESTORE] Cannot generate certificate: OpenSSL encryption not enabled");
+        return UA_STATUSCODE_BADNOTSUPPORTED;
+#endif
+    }
+    
+    return UA_STATUSCODE_GOOD;
+}
+
 int main(int argc, char* argv[]) {
     signal(SIGINT, stopHandler);
     signal(SIGTERM, stopHandler);
@@ -189,6 +337,17 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    /* Ensure PKI structure exists and server certificate is available */
+    /* This MUST be done BEFORE any UA_ServerConfig_setDefault* call */
+    UA_StatusCode pkiStatus = ensurePKIAndServerCertificate(&storePath);
+    if(pkiStatus != UA_STATUSCODE_GOOD) {
+        UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                    "Failed to ensure PKI structure and server certificate: %s",
+                    UA_StatusCode_name(pkiStatus));
+        UA_String_clear(&storePath);
+        return EXIT_FAILURE;
+    }
+    
     /* Build paths to own certificate and private key in PKI */
     /* Standard PKI structure: {storePath}/ApplCerts/own/{certs,private} */
     char certPath[4096], keyPath[4096];
@@ -197,79 +356,31 @@ int main(int argc, char* argv[]) {
     snprintf(keyPath, sizeof(keyPath), "%.*s/ApplCerts/own/private/server_key.der",
              (int)storePath.length, storePath.data);
     
-    /* Try to load certificate and private key from PKI FileStore FIRST */
+    /* Load certificate and private key from PKI FileStore */
+    /* ensurePKIAndServerCertificate guarantees these files exist */
     bool loadedFromPKI = false;
-    if(fileExists(certPath) && fileExists(keyPath)) {
-        certificate = loadFile(certPath);
-        privateKey = loadFile(keyPath);
-        
-        /* Validate that files were loaded successfully */
-        if(certificate.length > 0 && privateKey.length > 0) {
-            loadedFromPKI = true;
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                       "[FILESTORE] Loaded server certificate and key from PKI own/: %s", certPath);
-        } else {
-            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                           "Failed to load certificate or private key from PKI FileStore (files exist but are empty or invalid).");
-            if(certificate.length > 0)
-                UA_ByteString_clear(&certificate);
-            if(privateKey.length > 0)
-                UA_ByteString_clear(&privateKey);
-            certificate = UA_BYTESTRING_NULL;
-            privateKey = UA_BYTESTRING_NULL;
-        }
+    certificate = loadFile(certPath);
+    privateKey = loadFile(keyPath);
+    
+    /* Validate that files were loaded successfully */
+    if(certificate.length > 0 && privateKey.length > 0) {
+        loadedFromPKI = true;
+        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                   "[FILESTORE] Loaded server certificate and key from PKI: %s", certPath);
+    } else {
+        UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                     "Failed to load certificate or private key from PKI FileStore "
+                     "(files should exist after ensurePKIAndServerCertificate).");
+        if(certificate.length > 0)
+            UA_ByteString_clear(&certificate);
+        if(privateKey.length > 0)
+            UA_ByteString_clear(&privateKey);
+        UA_String_clear(&storePath);
+        return EXIT_FAILURE;
     }
     
-    /* Fallback: load from command line arguments (only if not loaded from PKI) */
-    if(!loadedFromPKI && argc >= 3) {
-        /* Fallback: load from command line arguments (for backward compatibility) */
-        UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                       "Certificate or key not found in PKI FileStore. Loading from command line arguments.");
-        certificate = loadFile(argv[1]);
-        privateKey = loadFile(argv[2]);
-        
-        /* Validate that files were loaded successfully */
-        if(certificate.length == 0 || privateKey.length == 0) {
-            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Failed to load certificate or private key file.");
-            if(certificate.length > 0)
-                UA_ByteString_clear(&certificate);
-            if(privateKey.length > 0)
-                UA_ByteString_clear(&privateKey);
-            return EXIT_FAILURE;
-        }
-    } else if(!loadedFromPKI) {
-        /* Generate PQC certificate directly (requires OpenSSL 3.0+ and OQS Provider) */
-        UA_String subject[3] = {UA_STRING_STATIC("C=DE"),
-                            UA_STRING_STATIC("O=SampleOrganization"),
-                            UA_STRING_STATIC("CN=Open62541Server@localhost")};
-        UA_UInt32 lenSubject = 3;
-        UA_String subjectAltName[2]= {
-            UA_STRING_STATIC("DNS:localhost"),
-            UA_STRING_STATIC("URI:urn:open62541.server.application")
-        };
-        UA_UInt32 lenSubjectAltName = 2;
-        
-        UA_StatusCode statusCertGen = UA_PQC_CreateCertificate(
-            UA_Log_Stdout, subject, lenSubject, subjectAltName, lenSubjectAltName,
-            UA_CERTIFICATEFORMAT_DER,
-            0,   /* rsaKeySizeBits - deprecated, ignored */
-            365, /* expiresInDays */
-            &privateKey,
-            &certificate);
-
-        if(statusCertGen != UA_STATUSCODE_GOOD) {
-            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Generating PQC Certificate failed: %s",
-                UA_StatusCode_name(statusCertGen));
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Make sure OpenSSL 3.0+ and OQS Provider are installed and available.");
-            UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "Alternatively, provide certificate files: "
-                "<server-certificate.der> <private-key.der>");
-            return EXIT_FAILURE;
-        }
-    }
+    /* Certificate and key are now loaded from PKI */
+    /* ensurePKIAndServerCertificate guarantees they exist */
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
     if(certificate.length > 0 && privateKey.length > 0) {
