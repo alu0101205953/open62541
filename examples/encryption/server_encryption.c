@@ -28,7 +28,32 @@
 #ifndef OQS_KEM_kyber_768_length_public_key
 #define OQS_KEM_kyber_768_length_public_key 1184
 #endif
-#endif
+
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+#include <openssl/provider.h>
+
+/* Check if OpenSSL 3.x with OQS Provider is available at runtime */
+static UA_Boolean isOpenSSL3WithOQSProviderAvailable(void) {
+    /* Runtime check: Try to load OQS Provider */
+    OSSL_PROVIDER *oqsProvider = OSSL_PROVIDER_load(NULL, "oqsprovider");
+    if(!oqsProvider) {
+        oqsProvider = OSSL_PROVIDER_load(NULL, "oqs");
+    }
+    
+    if(oqsProvider) {
+        OSSL_PROVIDER_unload(oqsProvider);
+        return true;
+    }
+    
+    return false;
+}
+#else
+/* OpenSSL 3.x not available at compile time */
+static UA_Boolean isOpenSSL3WithOQSProviderAvailable(void) {
+    return false;
+}
+#endif /* OPENSSL_VERSION_NUMBER >= 0x30000000L */
+#endif /* UA_ENABLE_ENCRYPTION_OPENSSL */
 
 #include <signal.h>
 #include <stdlib.h>
@@ -205,6 +230,7 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
     
     /* Step 3: Generate server certificate if missing */
     if(!certExists || !keyExists) {
+        /* Generate self-signed PQC certificate */
         UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                    "[FILESTORE] Server certificate or key missing. Generating self-signed PQC certificate...");
         
@@ -225,21 +251,46 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
         UA_UInt32 lenSubjectAltName = 2;
         
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
-        UA_StatusCode certGenStatus = UA_PQC_CreateCertificate(
-            UA_Log_Stdout, subject, lenSubject, subjectAltName, lenSubjectAltName,
-            UA_CERTIFICATEFORMAT_DER,
-            0,   /* rsaKeySizeBits - deprecated, ignored */
-            365, /* expiresInDays */
-            &privateKey,
-            &certificate);
-        
-        if(certGenStatus != UA_STATUSCODE_GOOD) {
-            UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                        "[FILESTORE] Failed to generate server certificate: %s",
-                        UA_StatusCode_name(certGenStatus));
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            return certGenStatus;
+        /* Check if OpenSSL 3.x with OQS Provider is available */
+        if(isOpenSSL3WithOQSProviderAvailable()) {
+            UA_StatusCode certGenStatus = UA_PQC_CreateCertificateWithOQSProvider(
+                UA_Log_Stdout,
+                subject,
+                lenSubject,
+                subjectAltName,
+                lenSubjectAltName,
+                UA_CERTIFICATEFORMAT_DER,
+                "ML-DSA-44",
+                365, /* expiresInDays */
+                &privateKey,
+                &certificate);
+            
+            if(certGenStatus != UA_STATUSCODE_GOOD) {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                            "[FILESTORE] Failed to generate server certificate with OQS Provider: %s",
+                            UA_StatusCode_name(certGenStatus));
+                UA_ByteString_clear(&certificate);
+                UA_ByteString_clear(&privateKey);
+                return certGenStatus;
+            }
+        } else {
+            /* Fallback to legacy API if OQS Provider not available */
+            UA_StatusCode certGenStatus = UA_PQC_CreateCertificate(
+                UA_Log_Stdout, subject, lenSubject, subjectAltName, lenSubjectAltName,
+                UA_CERTIFICATEFORMAT_DER,
+                0,   /* rsaKeySizeBits - deprecated, ignored */
+                365, /* expiresInDays */
+                &privateKey,
+                &certificate);
+            
+            if(certGenStatus != UA_STATUSCODE_GOOD) {
+                UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                            "[FILESTORE] Failed to generate server certificate: %s",
+                            UA_StatusCode_name(certGenStatus));
+                UA_ByteString_clear(&certificate);
+                UA_ByteString_clear(&privateKey);
+                return certGenStatus;
+            }
         }
         
         /* Step 4: Write certificate and key to PKI */
@@ -712,20 +763,19 @@ int main(int argc, char* argv[]) {
     /* Check retval before cleaning up resources */
     if(retval != UA_STATUSCODE_GOOD)
         goto cleanup;
-    
-    UA_ByteString_clear(&certificate);
-    UA_ByteString_clear(&privateKey);
 
     if(!running)
         goto cleanup; /* received ctrl-c already */
     
+    /* Certificate and privateKey are no longer needed after server initialization */
+    UA_ByteString_clear(&certificate);
+    UA_ByteString_clear(&privateKey);
     
     retval = UA_Server_run(server, &running);
 
  cleanup:
     UA_Server_delete(server);
-    UA_ByteString_clear(&certificate);
-    UA_ByteString_clear(&privateKey);
+    /* Certificate and privateKey are already cleared above, don't clear again */
     UA_String_clear(&storePath);
     return retval == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }
