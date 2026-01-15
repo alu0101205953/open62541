@@ -1638,28 +1638,66 @@ UA_PQC_HasCertificatePQCExtensions(const UA_ByteString *certificate, const UA_Lo
 }
 
 UA_EXPORT UA_StatusCode
-UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate) {
+UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate, void *issuerCert, const UA_Logger *logger) {
+    X509 *issuer = (X509 *)issuerCert;
     if(!certificate || certificate->length == 0 || !certificate->data)
         return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    const UA_Logger *log = logger ? logger : UA_Log_Stdout;
 
     UA_Boolean certWasPem = UA_FALSE;
     X509 *x509 = pqc_parse_x509_from_bytes(certificate, &certWasPem);
     if(!x509) {
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Failed to parse certificate");
         return UA_STATUSCODE_BADCERTIFICATEINVALID;
     }
 
-    /* Get the public key from the certificate */
-    EVP_PKEY *pubkey = X509_get_pubkey(x509);
-    if(!pubkey) {
-        X509_free(x509);
-        return UA_STATUSCODE_BADCERTIFICATEINVALID;
-    }
-
-    /* Verify the certificate signature using the certificate's own public key
-     * This works with OQS Provider if the certificate is PQC-signed */
-    int verifyResult = X509_verify(x509, pubkey);
+    int verifyResult = -1;
+    EVP_PKEY *issuerPubkey = NULL;
     
-    EVP_PKEY_free(pubkey);
+    if(issuer) {
+        /* Verify using issuer CA's public key (for CA-signed certificates) */
+        issuerPubkey = X509_get0_pubkey(issuer);
+        if(!issuerPubkey) {
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Failed to get issuer public key");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+        verifyResult = X509_verify(x509, issuerPubkey);
+    } else {
+        /* Self-signed verification: check if subject == issuer */
+        X509_NAME *subject = X509_get_subject_name(x509);
+        X509_NAME *issuer = X509_get_issuer_name(x509);
+        if(!subject || !issuer) {
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Failed to get subject/issuer name");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+        
+        if(X509_NAME_cmp(subject, issuer) == 0) {
+            /* Self-signed: verify using certificate's own public key */
+            EVP_PKEY *selfPubkey = X509_get_pubkey(x509);
+            if(selfPubkey) {
+                verifyResult = X509_verify(x509, selfPubkey);
+                EVP_PKEY_free(selfPubkey);
+            } else {
+                UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                               "UA_PQC_VerifyCertificateSignature: Failed to get certificate public key");
+                X509_free(x509);
+                return UA_STATUSCODE_BADCERTIFICATEINVALID;
+            }
+        } else {
+            /* Not self-signed but no issuer provided */
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Certificate is not self-signed but no issuer provided");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+    }
+    
     X509_free(x509);
 
     if(verifyResult == 1) {
@@ -1667,9 +1705,13 @@ UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate) {
         return UA_STATUSCODE_GOOD;
     } else if(verifyResult == 0) {
         /* Signature verification failed */
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Signature verification failed");
         return UA_STATUSCODE_BADCERTIFICATEINVALID;
     } else {
         /* Error during verification */
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Error during signature verification (OpenSSL error)");
         return UA_STATUSCODE_BADCERTIFICATEINVALID;
     }
 }

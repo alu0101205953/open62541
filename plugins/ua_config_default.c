@@ -22,6 +22,9 @@
 #include <open62541/plugin/certificategroup_default.h>
 #include <open62541/plugin/securitypolicy_default.h>
 #include <open62541/server_config_default.h>
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+#include <open62541/plugin/securitypolicy_pqc.h>
+#endif
 
 #include "../deps/mp_printf.h"
 
@@ -1996,22 +1999,43 @@ UA_ClientConfig_setDefaultWithFilestore(UA_ClientConfig *config,
     UA_ByteString keyPassword = UA_BYTESTRING_NULL;
     UA_StatusCode keySuccess = UA_STATUSCODE_GOOD;
 
-    if(privateKey && privateKey->length > 0)
-        keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword,
-                                                           &decryptedPrivateKey);
+    /* Check if this is a PQC certificate (has PQC extensions) */
+    UA_Boolean isPQCCert = UA_FALSE;
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+    if(localCertificate && localCertificate->length > 0) {
+        isPQCCert = UA_PQC_HasCertificatePQCExtensions(localCertificate, config->logging);
+    }
+#endif
 
-    /* Get the password and decrypt. An application might want to loop / retry
-     * here to allow users to correct their entry. */
-    if(keySuccess != UA_STATUSCODE_GOOD) {
-        if(config->privateKeyPasswordCallback)
-            keySuccess = config->privateKeyPasswordCallback(config, &keyPassword);
-        else
-            keySuccess = readPrivateKeyPassword(&keyPassword);
-        if(keySuccess != UA_STATUSCODE_GOOD)
+    /* For PQC certificates, check if the private key is in PQC-only format (4960 bytes raw) */
+    if(isPQCCert && privateKey && privateKey->length == 4960) {
+        /* PQC-only format: raw binary blob, no PEM/DER encoding
+         * Pass the key directly without OpenSSL parsing */
+        keySuccess = UA_ByteString_copy(privateKey, &decryptedPrivateKey);
+        if(keySuccess != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_USERLAND,
+                         "Failed to copy PQC-only private key");
             return keySuccess;
-        keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword, &decryptedPrivateKey);
-        UA_ByteString_memZero(&keyPassword);
-        UA_ByteString_clear(&keyPassword);
+        }
+    } else {
+        /* Traditional certificate: use OpenSSL to decrypt/parse the key */
+        if(privateKey && privateKey->length > 0)
+            keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword,
+                                                               &decryptedPrivateKey);
+
+        /* Get the password and decrypt. An application might want to loop / retry
+         * here to allow users to correct their entry. */
+        if(keySuccess != UA_STATUSCODE_GOOD) {
+            if(config->privateKeyPasswordCallback)
+                keySuccess = config->privateKeyPasswordCallback(config, &keyPassword);
+            else
+                keySuccess = readPrivateKeyPassword(&keyPassword);
+            if(keySuccess != UA_STATUSCODE_GOOD)
+                return keySuccess;
+            keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword, &decryptedPrivateKey);
+            UA_ByteString_memZero(&keyPassword);
+            UA_ByteString_clear(&keyPassword);
+        }
     }
     if(keySuccess != UA_STATUSCODE_GOOD)
         return keySuccess;

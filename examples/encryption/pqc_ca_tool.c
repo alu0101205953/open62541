@@ -21,6 +21,9 @@
 #ifndef OQS_SIG_dilithium_2_length_public_key
 #define OQS_SIG_dilithium_2_length_public_key 1312
 #endif
+#ifndef OQS_SIG_dilithium_2_length_secret_key
+#define OQS_SIG_dilithium_2_length_secret_key 2560
+#endif
 #ifndef OQS_KEM_kyber_768_length_public_key
 #define OQS_KEM_kyber_768_length_public_key 1184
 #endif
@@ -380,9 +383,20 @@ static int gen_csr(const char *subject, const char *san) {
         return 1;
     }
     
-    unsigned char *keyDer = NULL;
-    int keyLen = i2d_PrivateKey(appKey, &keyDer);
-    if(keyLen <= 0) {
+    /* Extract Dilithium private key in raw format (2560 bytes) */
+    uint8_t dilithiumPrivKey[OQS_SIG_dilithium_2_length_secret_key];
+    size_t dilithiumPrivKeyLen = sizeof(dilithiumPrivKey);
+    if(EVP_PKEY_get_octet_string_param(appKey, OSSL_PKEY_PARAM_PRIV_KEY, dilithiumPrivKey, dilithiumPrivKeyLen, &dilithiumPrivKeyLen) != 1) {
+        fprintf(stderr, "Error: Failed to extract Dilithium private key\n");
+        OPENSSL_free(csrDer);
+        X509_REQ_free(req);
+        EVP_PKEY_free(appKey);
+        return 1;
+    }
+    
+    if(dilithiumPrivKeyLen != OQS_SIG_dilithium_2_length_secret_key) {
+        fprintf(stderr, "Error: Dilithium private key size mismatch (got %zu, expected %d)\n", 
+                dilithiumPrivKeyLen, OQS_SIG_dilithium_2_length_secret_key);
         OPENSSL_free(csrDer);
         X509_REQ_free(req);
         EVP_PKEY_free(appKey);
@@ -392,26 +406,26 @@ static int gen_csr(const char *subject, const char *san) {
     if(writeFile("./out/app.csr", csrDer, csrLen) != 0) {
         fprintf(stderr, "Error: Failed to write CSR\n");
         OPENSSL_free(csrDer);
-        OPENSSL_free(keyDer);
         X509_REQ_free(req);
         EVP_PKEY_free(appKey);
         return 1;
     }
     
-    if(writeFile("./out/app_key.der", keyDer, keyLen) != 0) {
+    /* Note: We only save Dilithium key here. Kyber will be generated and saved during sign_cert */
+    /* Save Dilithium private key in raw format (temporary, will be replaced with PQC-only format in sign_cert) */
+    if(writeFile("./out/app_key.der", dilithiumPrivKey, dilithiumPrivKeyLen) != 0) {
         fprintf(stderr, "Error: Failed to write application key\n");
         OPENSSL_free(csrDer);
-        OPENSSL_free(keyDer);
         X509_REQ_free(req);
         EVP_PKEY_free(appKey);
         return 1;
     }
+    
     OPENSSL_free(csrDer);
-    OPENSSL_free(keyDer);
     X509_REQ_free(req);
     EVP_PKEY_free(appKey);
     
-    printf("CSR created successfully: ./out/app.csr, ./out/app_key.der\n");
+    printf("CSR created successfully: ./out/app.csr, ./out/app_key.der (Dilithium only, will be completed in sign_cert)\n");
     return 0;
 }
 
@@ -539,6 +553,51 @@ static int sign_cert(const char *csrPath) {
         sk_X509_EXTENSION_pop_free(reqExts, X509_EXTENSION_free);
     }
     
+    /* Extract Dilithium public key from CSR's SubjectPublicKeyInfo for the extension */
+    uint8_t dilithiumPubKey[OQS_SIG_dilithium_2_length_public_key];
+    size_t dilithiumPubKeyLen = sizeof(dilithiumPubKey);
+    if(EVP_PKEY_get_octet_string_param(reqPubKey, OSSL_PKEY_PARAM_PUB_KEY, dilithiumPubKey, dilithiumPubKeyLen, &dilithiumPubKeyLen) != 1) {
+        /* Try alternative parameter name */
+        if(EVP_PKEY_get_octet_string_param(reqPubKey, "pub", dilithiumPubKey, dilithiumPubKeyLen, &dilithiumPubKeyLen) != 1) {
+            fprintf(stderr, "Error: Failed to extract Dilithium public key from CSR\n");
+            X509_free(cert);
+            X509_REQ_free(req);
+            EVP_PKEY_free(caKey);
+            X509_free(caCert);
+            free(caCertData);
+            free(caKeyData);
+            free(csrData);
+            return 1;
+        }
+    }
+    
+    if(dilithiumPubKeyLen != OQS_SIG_dilithium_2_length_public_key) {
+        fprintf(stderr, "Error: Dilithium public key size mismatch (got %zu, expected %d)\n", 
+                dilithiumPubKeyLen, OQS_SIG_dilithium_2_length_public_key);
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    /* Add Dilithium extension (REQUIRED by open62541) */
+    if(addOctetExtension(cert, OID_DILITHIUM_PUB, dilithiumPubKey, OQS_SIG_dilithium_2_length_public_key) != 0) {
+        fprintf(stderr, "Error: Failed to add Dilithium extension\n");
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    /* Generate Kyber keypair for KEM */
     uint8_t kyberPubKey[OQS_KEM_kyber_768_length_public_key];
     uint8_t kyberPrivKey[OQS_KEM_kyber_768_length_secret_key];
     if(generateKyberKey(kyberPubKey, kyberPrivKey) != 0) {
@@ -552,7 +611,19 @@ static int sign_cert(const char *csrPath) {
         free(csrData);
         return 1;
     }
-    addOctetExtension(cert, OID_KYBER_PUB, kyberPubKey, OQS_KEM_kyber_768_length_public_key);
+    
+    /* Add Kyber extension (REQUIRED by open62541) */
+    if(addOctetExtension(cert, OID_KYBER_PUB, kyberPubKey, OQS_KEM_kyber_768_length_public_key) != 0) {
+        fprintf(stderr, "Error: Failed to add Kyber extension\n");
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
     
     if(X509_sign(cert, caKey, NULL) == 0) {
         if(X509_sign(cert, caKey, EVP_sha256()) == 0) {
@@ -607,6 +678,77 @@ static int sign_cert(const char *csrPath) {
         return 1;
     }
     
+    /* Load Dilithium private key from app_key.der (saved during gen_csr) */
+    unsigned char *dilithiumKeyData = NULL;
+    size_t dilithiumKeyLen = 0;
+    if(readFile("./out/app_key.der", &dilithiumKeyData, &dilithiumKeyLen) != 0) {
+        fprintf(stderr, "Error: Failed to read Dilithium private key from app_key.der\n");
+        OPENSSL_free(certDer);
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    if(dilithiumKeyLen != OQS_SIG_dilithium_2_length_secret_key) {
+        fprintf(stderr, "Error: Dilithium private key size mismatch (got %zu, expected %d)\n", 
+                dilithiumKeyLen, OQS_SIG_dilithium_2_length_secret_key);
+        free(dilithiumKeyData);
+        OPENSSL_free(certDer);
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    /* Create PQC-only format private key: [Dilithium 2560 bytes][Kyber 2400 bytes] = 4960 bytes total */
+    size_t totalPqcKeyLen = OQS_SIG_dilithium_2_length_secret_key + OQS_KEM_kyber_768_length_secret_key;
+    uint8_t *pqcOnlyKey = malloc(totalPqcKeyLen);
+    if(!pqcOnlyKey) {
+        fprintf(stderr, "Error: Failed to allocate memory for PQC-only key\n");
+        free(dilithiumKeyData);
+        OPENSSL_free(certDer);
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    /* Copy Dilithium private key (first 2560 bytes) */
+    memcpy(pqcOnlyKey, dilithiumKeyData, OQS_SIG_dilithium_2_length_secret_key);
+    /* Copy Kyber private key (next 2400 bytes) */
+    memcpy(pqcOnlyKey + OQS_SIG_dilithium_2_length_secret_key, kyberPrivKey, OQS_KEM_kyber_768_length_secret_key);
+    
+    /* Write PQC-only format private key (4960 bytes) */
+    if(writeFile("./out/app_key.der", pqcOnlyKey, totalPqcKeyLen) != 0) {
+        fprintf(stderr, "Error: Failed to write PQC-only private key\n");
+        free(pqcOnlyKey);
+        free(dilithiumKeyData);
+        OPENSSL_free(certDer);
+        X509_free(cert);
+        X509_REQ_free(req);
+        EVP_PKEY_free(caKey);
+        X509_free(caCert);
+        free(caCertData);
+        free(caKeyData);
+        free(csrData);
+        return 1;
+    }
+    
+    free(pqcOnlyKey);
+    free(dilithiumKeyData);
     OPENSSL_free(certDer);
     X509_free(cert);
     X509_REQ_free(req);
@@ -617,6 +759,8 @@ static int sign_cert(const char *csrPath) {
     free(csrData);
     
     printf("Certificate signed successfully: ./out/app_cert.der\n");
+    printf("PQC-only private key created: ./out/app_key.der (%zu bytes: Dilithium %d + Kyber %d)\n",
+           totalPqcKeyLen, OQS_SIG_dilithium_2_length_secret_key, OQS_KEM_kyber_768_length_secret_key);
     return 0;
 }
 

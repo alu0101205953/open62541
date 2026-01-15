@@ -159,15 +159,16 @@ UA_PQC_HasCertificatePQCExtensions(const UA_ByteString *certificate, const UA_Lo
 /**
  * Verify the signature of a PQC-signed X.509 certificate.
  *
- * This function parses the X.509 certificate, extracts the public key,
- * and verifies the certificate signature using OpenSSL 3 with OQS Provider.
+ * This function parses the X.509 certificate and verifies its signature using the issuer's public key.
  * The OQS Provider automatically handles PQC signature algorithms (e.g., Dilithium).
  *
  * @param certificate Certificate to verify (DER or PEM format)
+ * @param issuerCert Issuer CA certificate (opaque pointer, X509*). If NULL, verifies as self-signed.
+ * @param logger Logger instance (can be NULL)
  * @return UA_STATUSCODE_GOOD if signature is valid, UA_STATUSCODE_BADCERTIFICATEINVALID otherwise
  */
 UA_EXPORT UA_StatusCode
-UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate);
+UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate, void *issuerCert, const UA_Logger *logger);
 
 /**
  * Create a Certificate Signing Request (CSR) with PQC keys.
