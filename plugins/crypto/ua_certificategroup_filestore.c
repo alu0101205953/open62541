@@ -513,26 +513,63 @@ writeCertificates(UA_CertificateGroup *certGroup, const UA_ByteString *list,
         return UA_STATUSCODE_BADINTERNALERROR;
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
+    size_t successCount = 0;
+    size_t skipCount = 0;
+    size_t errorCount = 0;
+    
     for(size_t i = 0; i < listSize; i++) {
         /* Create filename to load */
         char filename[UA_PATH_MAX] = {0};
-        retval = getCertFileName(listPath, &list[i], filename, UA_PATH_MAX);
-        if(retval != UA_STATUSCODE_GOOD)
-            return UA_STATUSCODE_BADINTERNALERROR;
+        UA_StatusCode filenameResult = getCertFileName(listPath, &list[i], filename, UA_PATH_MAX);
+        if(filenameResult != UA_STATUSCODE_GOOD) {
+            /* Log error but continue with other certificates */
+            if(certGroup && certGroup->logging) {
+                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                              "[FILESTORE-REJECTED] Failed to generate filename for certificate %zu: %s",
+                              i, UA_StatusCode_name(filenameResult));
+            }
+            errorCount++;
+            continue;
+        }
 
         /* Check if certificate already exists - skip if it does to avoid duplication */
         struct UA_STAT sb;
         if(UA_stat(filename, &sb) == 0) {
             /* File already exists - skip writing to avoid duplication */
+            skipCount++;
             continue;
         }
 
         /* Store data in file */
-        retval = writeByteStringToFile(filename, &list[i]);
-        if(retval != UA_STATUSCODE_GOOD)
-            return retval;
+        UA_StatusCode writeResult = writeByteStringToFile(filename, &list[i]);
+        if(writeResult != UA_STATUSCODE_GOOD) {
+            /* Log error but continue with other certificates */
+            if(certGroup && certGroup->logging) {
+                UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                              "[FILESTORE-REJECTED] Failed to write certificate %zu to %s: %s",
+                              i, filename, UA_StatusCode_name(writeResult));
+            }
+            errorCount++;
+            continue;
+        }
+        
+        successCount++;
     }
-
+    
+    /* Log summary if there were any errors */
+    if(certGroup && certGroup->logging) {
+        if(errorCount > 0) {
+            UA_LOG_WARNING(certGroup->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                          "[FILESTORE-REJECTED] writeCertificates summary: %zu succeeded, %zu skipped, %zu failed",
+                          successCount, skipCount, errorCount);
+        }
+    }
+    
+    /* Return error if all certificates failed, otherwise return GOOD */
+    if(errorCount == listSize && listSize > 0) {
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    
     return retval;
 }
 
