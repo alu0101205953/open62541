@@ -126,9 +126,12 @@ int main(int argc, char* argv[]) {
     UA_ByteString certificate = UA_BYTESTRING_NULL;
     UA_ByteString privateKey = UA_BYTESTRING_NULL;
     UA_String clientStorePath = UA_STRING_NULL;
+    UA_Client *client = NULL;
+    UA_ClientConfig *cc = NULL;
     char *endpointUrl = NULL;
     char *serverCertFile = NULL;
     char *pkiPathArg = NULL;
+    UA_StatusCode retval = UA_STATUSCODE_GOOD;
 
     if(argc < MIN_ARGS) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -206,56 +209,56 @@ int main(int argc, char* argv[]) {
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create root PKI directory: %s", rootDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(applCertsDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create ApplCerts directory: %s", applCertsDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(ownCertsDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create own/certs directory: %s", ownCertsDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(ownPrivateDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create own/private directory: %s", ownPrivateDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(issuerCertsDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create issuer/certs directory: %s", issuerCertsDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(issuerCrlDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create issuer/crl directory: %s", issuerCrlDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     dirStatus = ensureDirectoryExists(trustedDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] Failed to create trusted directory: %s", trustedDir);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = dirStatus;
+        goto cleanup;
     }
     
     /* Verify that client certificate and key exist */
@@ -273,8 +276,8 @@ int main(int argc, char* argv[]) {
         }
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "[FILESTORE] PKI is incomplete. Use pqc_ca_tool to generate certificates externally.");
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+        goto cleanup;
     }
     
     /* Load certificate and private key from PKI FileStore */
@@ -291,27 +294,20 @@ int main(int argc, char* argv[]) {
             UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "[FILESTORE] Failed to load application private key from PKI: %s", keyPath);
         }
-        if(certificate.length > 0)
-            UA_ByteString_clear(&certificate);
-        if(privateKey.length > 0)
-            UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        retval = UA_STATUSCODE_BADINTERNALERROR;
+        goto cleanup;
     }
     
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                "[FILESTORE] Loaded client certificate and key from PKI: %s", certPath);
 
-    UA_Client *client = UA_Client_new();
+    client = UA_Client_new();
     if(!client) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "Failed to create client.");
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
-    UA_ClientConfig *cc = UA_Client_getConfig(client);
+    cc = UA_Client_getConfig(client);
     
     /* Increase buffer limits to avoid rejected messages with large PQC certificates */
     const UA_UInt32 bigBuf = 1 << 20; /* 1 MiB per TCP chunk */
@@ -323,16 +319,12 @@ int main(int argc, char* argv[]) {
     cc->localConnectionConfig.remoteMaxChunkCount = 1 << 20;   /* 1M chunks */
     
     /* Configure client with PKI FileStore */
-    UA_StatusCode retval = UA_ClientConfig_setDefaultWithFilestore(cc, &certificate, &privateKey, clientStorePath);
+    retval = UA_ClientConfig_setDefaultWithFilestore(cc, &certificate, &privateKey, clientStorePath);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "Failed to configure client with PKI FileStore: %s",
                     UA_StatusCode_name(retval));
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -400,11 +392,7 @@ int main(int argc, char* argv[]) {
     if(!innerPqcPolicy) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                      "Memory allocation failed for inner PQC policy");
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     memset(innerPqcPolicy, 0, sizeof(UA_SecurityPolicy));
 
@@ -414,11 +402,7 @@ int main(int argc, char* argv[]) {
                      "Failed to initialize inner PQC SecurityPolicy: %s",
                      UA_StatusCode_name(retval));
         UA_free(innerPqcPolicy);
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 
     /* Wrap PQC policy with filestore */
@@ -429,11 +413,7 @@ int main(int argc, char* argv[]) {
                      "Memory allocation failed for PQC policy");
         innerPqcPolicy->clear(innerPqcPolicy);
         UA_free(innerPqcPolicy);
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
     memset(cc->securityPolicies, 0, sizeof(UA_SecurityPolicy));
 
@@ -447,11 +427,7 @@ int main(int argc, char* argv[]) {
         UA_free(cc->securityPolicies);
         cc->securityPolicies = NULL;
         cc->securityPoliciesSize = 0;
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
 #endif
 
@@ -476,13 +452,7 @@ int main(int argc, char* argv[]) {
         if(cc->endpoint.serverCertificate.length == 0) {
             UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Failed to load server certificate file: %s", serverCertFile);
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_Client_delete(client);
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
 
         /* Configure user identity with certificate */
@@ -491,14 +461,7 @@ int main(int argc, char* argv[]) {
         if(!cc->endpoint.userIdentityTokens) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Memory allocation failed for user identity tokens");
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            UA_Client_delete(client);
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
         cc->endpoint.userIdentityTokensSize = 1;
         cc->endpoint.userIdentityTokens[0].tokenType = UA_USERTOKENTYPE_CERTIFICATE;
@@ -521,19 +484,7 @@ int main(int argc, char* argv[]) {
         if(!innerAuthPqcPolicy) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Memory allocation failed for inner PQC auth policy");
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            if(cc->endpoint.userIdentityTokens) {
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
-                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-            }
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            UA_Client_delete(client);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
         memset(innerAuthPqcPolicy, 0, sizeof(UA_SecurityPolicy));
 
@@ -543,19 +494,7 @@ int main(int argc, char* argv[]) {
                         "Failed to initialize inner PQC Auth SecurityPolicy: %s",
                         UA_StatusCode_name(retval));
             UA_free(innerAuthPqcPolicy);
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            if(cc->endpoint.userIdentityTokens) {
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
-                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-            }
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            UA_Client_delete(client);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
 
         /* Wrap auth PQC policy with filestore */
@@ -566,19 +505,7 @@ int main(int argc, char* argv[]) {
                         "Memory allocation failed for PQC auth policy");
             innerAuthPqcPolicy->clear(innerAuthPqcPolicy);
             UA_free(innerAuthPqcPolicy);
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            if(cc->endpoint.userIdentityTokens) {
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
-                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-            }
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            UA_Client_delete(client);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
         memset(cc->authSecurityPolicies, 0, sizeof(UA_SecurityPolicy));
 
@@ -592,19 +519,7 @@ int main(int argc, char* argv[]) {
             UA_free(cc->authSecurityPolicies);
             cc->authSecurityPolicies = NULL;
             cc->authSecurityPoliciesSize = 0;
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            if(cc->endpoint.userIdentityTokens) {
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
-                UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
-                UA_Array_delete(cc->endpoint.userIdentityTokens, 1, &UA_TYPES[UA_TYPES_USERTOKENPOLICY]);
-            }
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            UA_Client_delete(client);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
 #elif defined(UA_ENABLE_ENCRYPTION_MBEDTLS)
         cc->endpoint.securityPolicyUri = UA_String_fromChars("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
@@ -618,14 +533,7 @@ int main(int argc, char* argv[]) {
         if(!cc->endpoint.userIdentityTokens) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                         "Memory allocation failed for user identity tokens");
-            UA_String_clear(&cc->endpoint.endpointUrl);
-            UA_String_clear(&cc->endpoint.transportProfileUri);
-            UA_ByteString_clear(&cc->endpoint.serverCertificate);
-            UA_Client_delete(client);
-            UA_ByteString_clear(&certificate);
-            UA_ByteString_clear(&privateKey);
-            UA_String_clear(&clientStorePath);
-            return EXIT_FAILURE;
+            goto cleanup;
         }
         cc->endpoint.userIdentityTokensSize = 1;
 
@@ -644,15 +552,8 @@ int main(int argc, char* argv[]) {
 
     retval = UA_Client_connect(client, endpointUrl);
     if(retval != UA_STATUSCODE_GOOD) {
-        UA_ByteString_clear(&certificate);
-        UA_ByteString_clear(&privateKey);
-        UA_String_clear(&clientStorePath);
-        UA_Client_delete(client);
-        return EXIT_FAILURE;
+        goto cleanup;
     }
-
-    UA_ByteString_clear(&certificate);
-    UA_ByteString_clear(&privateKey);
 
     UA_Variant value;
     UA_Variant_init(&value);
@@ -685,7 +586,33 @@ int main(int argc, char* argv[]) {
     }
 
     UA_Variant_clear(&value);
-    UA_Client_delete(client);
+
+ cleanup:
+    if(client) {
+        if(cc) {
+            if(cc->securityPolicyUri.data) {
+                UA_String_clear(&cc->securityPolicyUri);
+            }
+            if(cc->endpoint.securityPolicyUri.data) {
+                UA_String_clear(&cc->endpoint.securityPolicyUri);
+            }
+            if(cc->endpoint.endpointUrl.data) {
+                UA_String_clear(&cc->endpoint.endpointUrl);
+            }
+            if(cc->endpoint.transportProfileUri.data) {
+                UA_String_clear(&cc->endpoint.transportProfileUri);
+            }
+            if(cc->endpoint.userIdentityTokens && cc->endpoint.userIdentityTokensSize > 0) {
+                if(cc->endpoint.userIdentityTokens[0].policyId.data) {
+                    UA_String_clear(&cc->endpoint.userIdentityTokens[0].policyId);
+                }
+                if(cc->endpoint.userIdentityTokens[0].securityPolicyUri.data) {
+                    UA_String_clear(&cc->endpoint.userIdentityTokens[0].securityPolicyUri);
+                }
+            }
+        }
+        UA_Client_delete(client);
+    }
     UA_ByteString_clear(&certificate);
     UA_ByteString_clear(&privateKey);
     UA_String_clear(&clientStorePath);
