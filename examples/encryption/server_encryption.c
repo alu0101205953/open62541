@@ -289,7 +289,16 @@ int main(int argc, char* argv[]) {
                          pkiPathArg);
             return EXIT_FAILURE;
         }
-        storePath = UA_STRING(pkiPathArg);
+        /* OWNERSHIP FIX: Use UA_String_fromChars to create an owning copy on the heap.
+         * UA_STRING() creates a non-owning reference to stack memory (argv), which cannot
+         * be safely freed. UA_String_fromChars() allocates a heap copy that must be
+         * cleaned up with UA_String_clear(). */
+        storePath = UA_String_fromChars(pkiPathArg);
+        if(storePath.length == 0) {
+            UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                         "Failed to allocate PKI path string");
+            return EXIT_FAILURE;
+        }
     } else {
         /* Default to ./pki in current directory */
         storePath = UA_String_fromChars("./pki");

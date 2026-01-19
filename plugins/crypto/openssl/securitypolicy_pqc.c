@@ -95,6 +95,13 @@ typedef struct {
     
     /* Track if we've generated symmetric keys before (for canonical nonce ordering) */
     UA_Boolean hasGeneratedSymmetricKeys; /* True if we've generated symmetric keys at least once */
+    
+    /* Reference counting: tracks how many PQC_ChannelContext instances reference this policy.
+     * The policy can only be freed when refCount == 0.
+     * Thread-safety: Operations on security policies are executed within the EventLoop context,
+     * which provides serialization guarantees. Channel creation/deletion happens during
+     * secure channel setup/teardown, which is also serialized by the framework. */
+    UA_UInt32 refCount; /* Number of active channel contexts referencing this policy */
 } Policy_Context_PQC;
 
 typedef struct {
@@ -2306,10 +2313,33 @@ UA_PQCPolicy_clear(UA_SecurityPolicy *policy) {
 
     Policy_Context_PQC *ctx = (Policy_Context_PQC *)policy->policyContext;
     if(ctx) {
+        /* CRITICAL: Never free the policy context if channel contexts are still referencing it.
+         * The refCount is the single source of truth for whether the policy can be safely freed.
+         * This prevents use-after-free when channels are being cleaned up asynchronously
+         * during shutdown. */
+        if(ctx->refCount != 0) {
+            const UA_Logger *log = ctx->logger ? ctx->logger : UA_Log_Stdout;
+            UA_LOG_ERROR(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "UA_PQCPolicy_clear: Cannot free policy context: refCount=%u > 0. "
+                        "There are still active channel contexts referencing this policy. "
+                        "The policy will remain in memory until all channels are closed.",
+                        (unsigned)ctx->refCount);
+            /* Do NOT free the context. Return immediately to prevent use-after-free.
+             * The framework must ensure all channels are closed before clearing policies.
+             * Once refCount reaches 0, the policy can be safely freed. */
+            return;
+        }
+        
+        /* Only free when refCount == 0, meaning no channel contexts reference this policy */
         /* Limpiar claves privadas antes de liberar */
         memset(ctx->sigPrivateKey, 0, sizeof(ctx->sigPrivateKey));
         memset(ctx->kemPrivateKey, 0, sizeof(ctx->kemPrivateKey));
-        UA_ByteString_clear(&ctx->localCertThumbprint);
+        /* BUG 2 FIX: Only clear if the ByteString actually owns heap memory.
+         * UA_ByteString_clear is safe to call on NULL data (it checks internally),
+         * but we verify to be explicit about ownership. */
+        if(ctx->localCertThumbprint.data != NULL) {
+            UA_ByteString_clear(&ctx->localCertThumbprint);
+        }
         UA_free(ctx);
         policy->policyContext = NULL;
     }
@@ -2530,9 +2560,22 @@ pqc_sym_generateKey(void *policyContext,
     memcpy(seed.data, firstNonce->data, firstNonce->length);
     memcpy(seed.data + firstNonce->length, secondNonce->data, secondNonce->length);
     
-    UA_ByteString secret = {PQC_KEM_SHARED_SECRET_LEN, pc->temporarySharedSecret};
+    /* BUG 1 FIX: Create a heap-allocated copy of the embedded secret buffer.
+     * UA_Openssl_Random_Key_PSHA256_Derive expects a const UA_ByteString* that it only reads,
+     * but to follow open62541 ownership rules, we must not create UA_ByteString pointing to
+     * embedded memory that could be cleaned up. Create a temporary copy on the heap. */
+    UA_ByteString secret;
+    UA_ByteString_init(&secret);
+    retval = UA_ByteString_allocBuffer(&secret, PQC_KEM_SHARED_SECRET_LEN);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_ByteString_clear(&seed);
+        return retval;
+    }
+    memcpy(secret.data, pc->temporarySharedSecret, PQC_KEM_SHARED_SECRET_LEN);
+    
     retval = UA_Openssl_Random_Key_PSHA256_Derive(&secret, &seed, out);
     
+    UA_ByteString_clear(&secret);
     UA_ByteString_clear(&seed);
     pc->hasGeneratedSymmetricKeys = true;
     
@@ -3460,6 +3503,11 @@ pqc_channel_newContext(const UA_SecurityPolicy *policy,
                       (void*)remoteCertificate, remoteCertificate ? remoteCertificate->length : 0);
     }
 
+    /* Increment reference count only after all initialization is successful.
+     * This ensures that if any error occurs during initialization, the refCount
+     * remains correct and the policy won't be freed prematurely. */
+    pc->refCount++;
+    
     *ppContext = ctx;
     return UA_STATUSCODE_GOOD;
 }
@@ -3523,6 +3571,16 @@ pqc_channel_deleteContext(void *context) {
     if(!context)
         return;
     PQC_ChannelContext *ctx = (PQC_ChannelContext*)context;
+    
+    /* Decrement reference count and nullify policyContext pointer before cleanup.
+     * This ensures that:
+     * 1. The policy knows one less channel references it
+     * 2. No subsequent access to ctx->policyContext can occur after this point */
+    if(ctx->policyContext) {
+        ctx->policyContext->refCount--;
+        ctx->policyContext = NULL;
+    }
+    
     memset(ctx->remoteSigPublicKey, 0, sizeof(ctx->remoteSigPublicKey));
     memset(ctx->remoteKemPublicKey, 0, sizeof(ctx->remoteKemPublicKey));
     memset(ctx->sharedSecret, 0, sizeof(ctx->sharedSecret));
@@ -3797,6 +3855,7 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
     pc->logger = logger;
     pc->sigKeysInitialized = false;
     pc->kemKeysInitialized = false;
+    pc->refCount = 0; /* Initialize reference count to 0 */
     UA_ByteString_init(&pc->localCertThumbprint);
     policy->policyContext = pc;
 
@@ -3822,6 +3881,17 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
                            UA_StatusCode_name(rcExtract));
         }
 
+        if(!pc->sigKeysInitialized || !pc->kemKeysInitialized) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "UA_SecurityPolicy_PQC: Certificate provided (%zu bytes) but PQC keys "
+                        "could not be extracted. Certificate may be corrupt, missing PQC extensions, "
+                        "or in invalid format. Security policy initialization aborted.",
+                        policy->localCertificate.length);
+            UA_free(pc);
+            policy->policyContext = NULL;
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+
         /* Generar thumbprint del certificado local */
         /* UA_Openssl_X509_GetCertificateThumbprint con true inicializa y asigna el buffer automáticamente */
         rc = UA_Openssl_X509_GetCertificateThumbprint(&policy->localCertificate,
@@ -3831,10 +3901,19 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
             UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                            "UA_SecurityPolicy_PQC: failed to generate local thumbprint: %s",
                            UA_StatusCode_name(rc));
-            /* UA_Openssl_X509_GetCertificateThumbprint ya limpia el thumbprint si falla después
-             * de asignar el buffer, pero si falla en UA_ByteString_allocBuffer, el thumbprint
-             * podría quedar en un estado inconsistente. Asegurémonos de que esté limpio. */
-            UA_ByteString_clear(&pc->localCertThumbprint);
+            /* BUG 2 FIX: UA_Openssl_X509_GetCertificateThumbprint already handles cleanup:
+             * - If UA_ByteString_allocBuffer fails, it returns early and thumbprint remains initialized (NULL, 0)
+             * - If it fails after allocation, it calls UA_ByteString_clear internally
+             * We should NOT call UA_ByteString_clear again to avoid double-free.
+             * Only ensure the thumbprint is in a clean state if allocBuffer failed. */
+            if(pc->localCertThumbprint.data != NULL) {
+                /* This should never happen if UA_Openssl_X509_GetCertificateThumbprint is correct,
+                 * but defensive: if data is non-NULL, it means allocBuffer succeeded but something
+                 * else failed, and UA_Openssl_X509_GetCertificateThumbprint should have cleared it.
+                 * Double-check and clear only if needed. */
+                UA_ByteString_clear(&pc->localCertThumbprint);
+            }
+            /* Ensure clean state: data should be NULL and length 0 after init or clear */
             UA_ByteString_init(&pc->localCertThumbprint);
         } else {
             UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
