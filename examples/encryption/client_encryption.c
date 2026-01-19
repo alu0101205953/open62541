@@ -114,8 +114,6 @@ static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
     }
     #endif
     
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-               "[FILESTORE] Created PKI directory: %s", dirPath);
     return UA_STATUSCODE_GOOD;
 }
 
@@ -297,9 +295,6 @@ int main(int argc, char* argv[]) {
         retval = UA_STATUSCODE_BADINTERNALERROR;
         goto cleanup;
     }
-    
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-               "[FILESTORE] Loaded client certificate and key from PKI: %s", certPath);
 
     client = UA_Client_new();
     if(!client) {
@@ -327,10 +322,6 @@ int main(int argc, char* argv[]) {
         goto cleanup;
     }
 
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "[FILESTORE] PKI initialized at %.*s",
-                (int)clientStorePath.length, clientStorePath.data);
-
     /* Ensure all PKI directories exist physically on disk */
     typedef struct {
         UA_CertificateGroup *store;
@@ -355,7 +346,7 @@ int main(int argc, char* argv[]) {
                      (int)(str).length, (char*)(str).data); \
             UA_StatusCode dirStatus = ensureDirectoryExists(dirPath); \
             if(dirStatus != UA_STATUSCODE_GOOD) { \
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, \
+                UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, \
                               "[FILESTORE] Failed to create directory: %s", dirPath); \
             } \
         } \
@@ -574,13 +565,12 @@ int main(int argc, char* argv[]) {
         int result6 = fprintf(stdout, "\n");
         
         if(result1 < 0 || result2 < 0 || result3 < 0 || result4 < 0 || result5 < 0 || result6 < 0) {
-            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                          "Failed to write output to stdout (broken pipe or I/O error). "
-                          "This may occur when output is redirected to a pipe that closes early.");
+            UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                          "Failed to write output to stdout (broken pipe or I/O error)");
         } else {
             if(fflush(stdout) != 0) {
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                              "Failed to flush stdout (broken pipe or I/O error).");
+                UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
+                              "Failed to flush stdout");
             }
         }
     }

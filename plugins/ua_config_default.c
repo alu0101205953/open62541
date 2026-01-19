@@ -911,6 +911,43 @@ addAllSecurityPolicies(UA_SecurityPolicy *sp, size_t *length,
                        const UA_ByteString certificate, const UA_ByteString privateKey,
                        UA_Boolean onlySecure, UA_ApplicationType applicationType,
                        UA_Logger *logging) {
+    /* Check if certificate is PQC (has PQC extensions).
+     * If so, skip RSA/ECC policies as they are incompatible with PQC-only certificates. */
+    UA_Boolean isPQCCert = UA_FALSE;
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+    if(certificate.length > 0 && certificate.data) {
+        isPQCCert = UA_PQC_HasCertificatePQCExtensions(&certificate, logging);
+    }
+#endif
+
+    /* For PQC certificates, only add PQC policy and SecurityPolicy#None.
+     * Skip RSA/ECC policies as they require RSA/ECC keys which are not available in PQC-only certificates. */
+    if(isPQCCert) {
+        /* Kyber768+Dilithium2 */
+        UA_StatusCode retval = UA_SecurityPolicy_PQC(sp + *length, certificate, privateKey, logging);
+        *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(logging, UA_LOGCATEGORY_USERLAND,
+                           "Could not add SecurityPolicy#PQC with error code %s",
+                           UA_StatusCode_name(retval));
+        }
+        
+        /* Don't add "unsecure" SecurityPolicies */
+        if(onlySecure)
+            return;
+        
+        /* None */
+        retval = UA_SecurityPolicy_None(sp + *length, certificate, logging);
+        *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(logging, UA_LOGCATEGORY_USERLAND,
+                           "Could not add SecurityPolicy#None with error code %s",
+                           UA_StatusCode_name(retval));
+        }
+        return;
+    }
+
+    /* For non-PQC certificates, add all standard policies */
     /* Basic256Sha256 */
     UA_StatusCode retval = UA_SecurityPolicy_Basic256Sha256(sp + *length, certificate, privateKey, logging);
     *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;

@@ -590,7 +590,7 @@ void
 processOPNResponse(UA_Client *client, const UA_ByteString *message) {
     /* Is the content of the expected type? */
     size_t offset = 0;
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] processOPNResponse: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
                  (int)client->channel.state,
                  (int)endpointUnconfigured(&client->endpoint),
@@ -716,7 +716,7 @@ sendOPNAsync(UA_Client *client, UA_Boolean renew) {
         return;
     }
 
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] sendOPNAsync: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s renew=%d",
                  (int)client->channel.state,
                  (int)endpointUnconfigured(&client->endpoint),
@@ -1093,7 +1093,7 @@ activateSessionAsync(UA_Client *client) {
     if(!utp) {
         /* Search for CERTIFICATE UserTokenPolicy with PQC securityPolicyUri */
         static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-UTP-CERT] activateSessionAsync: No matching UserTokenPolicy found, "
                     "searching for CERTIFICATE UserTokenPolicy with PQC securityPolicyUri");
         
@@ -1106,7 +1106,7 @@ activateSessionAsync(UA_Client *client) {
                     tokenPolicyUri = client->endpoint.securityPolicyUri;
                 
                 if(UA_String_equal(&tokenPolicyUri, &pqcPolicyUri)) {
-                    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+                    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                                 "[TRACE-UTP-CERT] activateSessionAsync: Found CERTIFICATE UserTokenPolicy[%zu] - "
                                 "policyId=%S, securityPolicyUri=%S (PQC)",
                                 j, tokenPolicy->policyId, tokenPolicyUri);
@@ -1127,7 +1127,7 @@ activateSessionAsync(UA_Client *client) {
     UA_String tokenPolicyUri = utp->securityPolicyUri;
     if(UA_String_isEmpty(&tokenPolicyUri))
         tokenPolicyUri = client->endpoint.securityPolicyUri;
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-UTP-CERT] activateSessionAsync: Selected UserTokenPolicy - "
                 "tokenType=%d (CERTIFICATE=%d), policyId=%S, securityPolicyUri=%S",
                 (int)utp->tokenType, (int)UA_USERTOKENTYPE_CERTIFICATE,
@@ -1199,7 +1199,7 @@ activateSessionAsync(UA_Client *client) {
         request.userIdentityToken.content.decoded.type = &UA_TYPES[UA_TYPES_X509IDENTITYTOKEN];
         request.userIdentityToken.content.decoded.data = x509Token;
         
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-UTP-CERT] activateSessionAsync: Created X509IdentityToken - "
                     "policyId=%S, certificateData.length=%zu",
                     x509Token->policyId, x509Token->certificateData.length);
@@ -1457,7 +1457,7 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
     
     /* [TRACE-UTP] Log client configuration */
     const UA_DataType *clientTokenType = client->config.userIdentityToken.content.decoded.type;
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-UTP] findUserTokenPolicy: Client config - "
                 "userIdentityToken.type=%p (%s), authSecurityPolicyUri.length=%zu, "
                 "endpoint.securityPolicyUri=%S",
@@ -1467,7 +1467,7 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
                 endpoint->securityPolicyUri);
     
     if(clientTokenType) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-UTP] findUserTokenPolicy: Client token type name=%s",
                     clientTokenType->typeName);
     }
@@ -1480,7 +1480,7 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
         requiredTokenPolicy = &client->config.userTokenPolicy;
 
     /* [TRACE-UTP] Log all available UserTokenPolicies in endpoint */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-UTP] findUserTokenPolicy: Endpoint has %zu UserTokenPolicies",
                 endpoint->userIdentityTokensSize);
     
@@ -1500,7 +1500,7 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
             case UA_USERTOKENTYPE_ISSUEDTOKEN: tokenTypeName = "ISSUEDTOKEN"; break;
         }
         
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-UTP] findUserTokenPolicy: tokenPolicy[%zu] - "
                     "tokenType=%d (%s), policyId=%S, securityPolicyUri=%S",
                     j, (int)tokenPolicy->tokenType, tokenTypeName,
@@ -1559,7 +1559,7 @@ findUserTokenPolicy(UA_Client *client, UA_EndpointDescription *endpoint) {
         return tokenPolicy;
     }
 
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-UTP] findUserTokenPolicy: No matching UserTokenPolicy found");
     return NULL;
 }
@@ -1570,7 +1570,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
                      UA_UInt32 requestId, void *response) {
     UA_LOCK_ASSERT(&client->clientMutex);
 
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] responseGetEndpoints: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
                  (int)client->channel.state,
                  (int)endpointUnconfigured(&client->endpoint),
@@ -1614,7 +1614,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
         UA_EndpointDescription* endpoint = &resp->endpoints[i];
         
         /* [TRACE-CERT] Log serverCertificate in GetEndpointsResponse */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: endpoint[%zu] serverCertificate.length=%zu "
                     "serverCertificate.data=%p securityPolicyUri=%S",
                     i, endpoint->serverCertificate.length,
@@ -1715,7 +1715,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
      * client expects (e.g., for custom security policies like PQC). */
     
     /* [TRACE-CERT] Log serverCertificate BEFORE assignment */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-CERT] responseGetEndpoints: BEFORE assignment - "
                 "resp->endpoints[%zu].serverCertificate.length=%zu serverCertificate.data=%p",
                 bestEndpointIndex,
@@ -1727,7 +1727,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
     UA_EndpointDescription_init(&resp->endpoints[bestEndpointIndex]);
     
     /* [TRACE-CERT] Log serverCertificate AFTER assignment */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-CERT] responseGetEndpoints: AFTER assignment - "
                 "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
                 client->endpoint.serverCertificate.length,
@@ -1787,7 +1787,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
          * to avoid re-entering discovery loop. */
         
         /* [TRACE-CERT] Log serverCertificate BEFORE copy */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: BEFORE copy - "
                     "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p "
                     "securityPolicyUri=%S",
@@ -1801,7 +1801,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
             UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
         
         /* [TRACE-CERT] Log serverCertificate AFTER copy */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: AFTER copy - "
                     "preservedEndpoint.serverCertificate.length=%zu serverCertificate.data=%p "
                     "copyRc=%s",
@@ -1836,7 +1836,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
          * to avoid re-entering discovery loop. */
         
         /* [TRACE-CERT] Log serverCertificate BEFORE copy (URL mismatch) */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: BEFORE copy (URL mismatch) - "
                     "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
                     client->endpoint.serverCertificate.length,
@@ -1848,7 +1848,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
             UA_EndpointDescription_copy(&client->endpoint, &preservedEndpoint);
         
         /* [TRACE-CERT] Log serverCertificate AFTER copy (URL mismatch) */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: AFTER copy (URL mismatch) - "
                     "preservedEndpoint.serverCertificate.length=%zu serverCertificate.data=%p",
                     preservedEndpoint.serverCertificate.length,
@@ -1868,7 +1868,7 @@ responseGetEndpoints(UA_Client *client, void *userdata,
         client->endpoint = preservedEndpoint;
         
         /* [TRACE-CERT] Log serverCertificate AFTER restore (URL mismatch) */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] responseGetEndpoints: AFTER restore (URL mismatch) - "
                     "client->endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
                     client->endpoint.serverCertificate.length,
@@ -1887,7 +1887,7 @@ static UA_StatusCode
 requestGetEndpoints(UA_Client *client) {
     UA_LOCK_ASSERT(&client->clientMutex);
 
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] requestGetEndpoints: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
                  (int)client->channel.state,
                  (int)endpointUnconfigured(&client->endpoint),
@@ -2273,7 +2273,7 @@ initSecurityPolicy(UA_Client *client) {
     static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
     
     /* [TRACE-CERT] Log serverCertificate in initSecurityPolicy before PQC check */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE-CERT] initSecurityPolicy: BEFORE PQC check - "
                 "sp->policyUri=%S endpoint.securityPolicyUri=%S "
                 "endpoint.serverCertificate.length=%zu serverCertificate.data=%p",
@@ -2283,7 +2283,7 @@ initSecurityPolicy(UA_Client *client) {
     
     if(UA_String_equal(&sp->policyUri, &pqcPolicyUri) &&
        client->endpoint.serverCertificate.length == 0) {
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] initSecurityPolicy: PQC policy but serverCertificate.length==0 - "
                     "falling back to SecurityPolicy#None");
         UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
@@ -2362,7 +2362,7 @@ initSecurityPolicy(UA_Client *client) {
 static void
 connectActivity(UA_Client *client) {
     UA_LOCK_ASSERT(&client->clientMutex);
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] connectActivity: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
                  (int)client->channel.state,
                  (int)endpointUnconfigured(&client->endpoint),
@@ -2827,7 +2827,7 @@ initConnect(UA_Client *client) {
                     client->endpoint.securityPolicyUri);
         
         /* [TRACE-CERT] Log serverCertificate in initConnect */
-        UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+        UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                     "[TRACE-CERT] initConnect: preserved endpoint - "
                     "serverCertificate.length=%zu serverCertificate.data=%p",
                     client->endpoint.serverCertificate.length,
@@ -3354,7 +3354,7 @@ closeSecureChannel(UA_Client *client) {
     /* If we close SecureChannel when the Session is still active, set to
      * created. Otherwise the Session would remain active until the connection
      * callback is called for the closing connection. */
-    UA_LOG_INFO(client->config.logging, UA_LOGCATEGORY_CLIENT,
+    UA_LOG_DEBUG(client->config.logging, UA_LOGCATEGORY_CLIENT,
                 "[TRACE] closeSecureChannel: state=%d unconf=%d epPolLen=%zu discLen=%zu connectStatus=%s",
                 (int)client->channel.state,
                 (int)endpointUnconfigured(&client->endpoint),

@@ -126,8 +126,6 @@ static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
     }
     #endif
     
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-               "[FILESTORE] Created PKI directory: %s", dirPath);
     return UA_STATUSCODE_GOOD;
 }
 
@@ -217,8 +215,6 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
     bool keyExists = fileExists(keyPath);
     
     if(certExists && keyExists) {
-        UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                   "[FILESTORE] Server certificate and key found in PKI: %s", certPath);
         return UA_STATUSCODE_GOOD;
     }
     
@@ -341,9 +337,6 @@ int main(int argc, char* argv[]) {
         UA_String_clear(&storePath);
         return EXIT_FAILURE;
     }
-    
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-               "[FILESTORE] Loaded server certificate and key from PKI: %s", certPath);
 
     UA_Server *server = UA_Server_new();
     if(!server) {
@@ -405,11 +398,6 @@ int main(int argc, char* argv[]) {
         goto cleanup;
     }
 
-    /* Log PKI initialization */
-    UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
-                "[FILESTORE] PKI initialized at %.*s",
-                (int)storePath.length, storePath.data);
-
     /* Ensure all PKI directories exist physically on disk */
     typedef struct {
         UA_CertificateGroup *store;
@@ -433,7 +421,7 @@ int main(int argc, char* argv[]) {
                      (int)(str).length, (char*)(str).data); \
             UA_StatusCode dirStatus = ensureDirectoryExists(dirPath); \
             if(dirStatus != UA_STATUSCODE_GOOD) { \
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, \
+                UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, \
                               "[FILESTORE] Failed to create directory: %s", dirPath); \
             } \
         } \
@@ -534,16 +522,16 @@ int main(int argc, char* argv[]) {
                     UA_PQCPolicy_registerRemoteKeys(&config->securityPolicies[idx],
                                                     clientSigKey, clientKemKey);
                 if(rc != UA_STATUSCODE_GOOD) {
-                    UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                    UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
                                    "Failed to register client PQC keys override: %s",
                                    UA_StatusCode_name(rc));
                 }
             } else {
-                UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
-                               "No security policies available to register client PQC keys.");
+                UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+                               "No security policies available to register client PQC keys");
             }
         } else {
-            UA_LOG_WARNING(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(UA_Log_Stdout, UA_LOGCATEGORY_SECURITYPOLICY,
                            "Client PQC key files have unexpected size (sig=%zu, kem=%zu)",
                            (size_t)clientSigKey.length, (size_t)clientKemKey.length);
         }
