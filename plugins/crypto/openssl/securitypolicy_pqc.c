@@ -2334,9 +2334,7 @@ UA_PQCPolicy_clear(UA_SecurityPolicy *policy) {
         /* Limpiar claves privadas antes de liberar */
         memset(ctx->sigPrivateKey, 0, sizeof(ctx->sigPrivateKey));
         memset(ctx->kemPrivateKey, 0, sizeof(ctx->kemPrivateKey));
-        /* BUG 2 FIX: Only clear if the ByteString actually owns heap memory.
-         * UA_ByteString_clear is safe to call on NULL data (it checks internally),
-         * but we verify to be explicit about ownership. */
+        /* Only clear if the ByteString owns heap memory */
         if(ctx->localCertThumbprint.data != NULL) {
             UA_ByteString_clear(&ctx->localCertThumbprint);
         }
@@ -2560,10 +2558,7 @@ pqc_sym_generateKey(void *policyContext,
     memcpy(seed.data, firstNonce->data, firstNonce->length);
     memcpy(seed.data + firstNonce->length, secondNonce->data, secondNonce->length);
     
-    /* BUG 1 FIX: Create a heap-allocated copy of the embedded secret buffer.
-     * UA_Openssl_Random_Key_PSHA256_Derive expects a const UA_ByteString* that it only reads,
-     * but to follow open62541 ownership rules, we must not create UA_ByteString pointing to
-     * embedded memory that could be cleaned up. Create a temporary copy on the heap. */
+    /* Create heap-allocated copy of embedded secret (required for UA_ByteString ownership) */
     UA_ByteString secret;
     UA_ByteString_init(&secret);
     retval = UA_ByteString_allocBuffer(&secret, PQC_KEM_SHARED_SECRET_LEN);
@@ -3901,11 +3896,8 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
             UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                            "UA_SecurityPolicy_PQC: failed to generate local thumbprint: %s",
                            UA_StatusCode_name(rc));
-            /* BUG 2 FIX: UA_Openssl_X509_GetCertificateThumbprint already handles cleanup:
-             * - If UA_ByteString_allocBuffer fails, it returns early and thumbprint remains initialized (NULL, 0)
-             * - If it fails after allocation, it calls UA_ByteString_clear internally
-             * We should NOT call UA_ByteString_clear again to avoid double-free.
-             * Only ensure the thumbprint is in a clean state if allocBuffer failed. */
+            /* UA_Openssl_X509_GetCertificateThumbprint handles cleanup internally.
+             * Only clear if data is non-NULL (should not happen, but defensive check). */
             if(pc->localCertThumbprint.data != NULL) {
                 /* This should never happen if UA_Openssl_X509_GetCertificateThumbprint is correct,
                  * but defensive: if data is non-NULL, it means allocBuffer succeeded but something

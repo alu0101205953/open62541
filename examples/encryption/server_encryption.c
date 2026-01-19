@@ -131,9 +131,9 @@ static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
     return UA_STATUSCODE_GOOD;
 }
 
-/* Ensure PKI structure exists and verify server certificate is available */
-/* This function MUST be called BEFORE UA_ServerConfig_setDefaultWithFilestore or UA_ServerConfig_setDefaultWithSecurityPolicies */
-/* The server does NOT generate certificates - they must be created externally using pqc_ca_tool */
+/* Ensure PKI structure exists and verify server certificate is available.
+ * Must be called before UA_ServerConfig_setDefaultWithFilestore.
+ * Certificates must be created externally using pqc_ca_tool. */
 static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
     if(!storePath || !storePath->data || storePath->length == 0) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -163,7 +163,6 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
     snprintf(certPath, sizeof(certPath), "%.*s/ApplCerts/own/certs/server_cert.der", (int)storePath->length, storePath->data);
     snprintf(keyPath, sizeof(keyPath), "%.*s/ApplCerts/own/private/server_key.der", (int)storePath->length, storePath->data);
     
-    /* Step 1: Create PKI directory structure */
     UA_StatusCode retval = ensureDirectoryExists(rootDir);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -213,7 +212,7 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
         return retval;
     }
     
-    /* Step 2: Verify that server certificate and key exist */
+    /* Verify that server certificate and key exist */
     bool certExists = fileExists(certPath);
     bool keyExists = fileExists(keyPath);
     
@@ -223,7 +222,6 @@ static UA_StatusCode ensurePKIAndServerCertificate(const UA_String *storePath) {
         return UA_STATUSCODE_GOOD;
     }
     
-    /* Step 3: Fail if certificate or key is missing */
     if(!certExists || !keyExists) {
         if(!certExists) {
             UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -289,10 +287,7 @@ int main(int argc, char* argv[]) {
                          pkiPathArg);
             return EXIT_FAILURE;
         }
-        /* OWNERSHIP FIX: Use UA_String_fromChars to create an owning copy on the heap.
-         * UA_STRING() creates a non-owning reference to stack memory (argv), which cannot
-         * be safely freed. UA_String_fromChars() allocates a heap copy that must be
-         * cleaned up with UA_String_clear(). */
+        /* Use UA_String_fromChars to create an owning heap copy (required for UA_String_clear) */
         storePath = UA_String_fromChars(pkiPathArg);
         if(storePath.length == 0) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -309,9 +304,6 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    /* Ensure PKI structure exists and verify server certificate is available */
-    /* This MUST be done BEFORE any UA_ServerConfig_setDefault* call */
-    /* Certificates must be generated externally using pqc_ca_tool */
     UA_StatusCode pkiStatus = ensurePKIAndServerCertificate(&storePath);
     if(pkiStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -322,7 +314,6 @@ int main(int argc, char* argv[]) {
     }
     
     /* Build paths to own certificate and private key in PKI */
-    /* Standard PKI structure: {storePath}/ApplCerts/own/{certs,private} */
     char certPath[4096], keyPath[4096];
     snprintf(certPath, sizeof(certPath), "%.*s/ApplCerts/own/certs/server_cert.der",
              (int)storePath.length, storePath.data);
@@ -367,13 +358,6 @@ int main(int argc, char* argv[]) {
 
     UA_StatusCode retval = UA_STATUSCODE_GOOD;
     
-    /* Configure server with PKI FileStore - this sets up the PKI structure */
-    /* Note: We pass NULL for certificate/privateKey here because we'll add PQC policy separately */
-    /* But we need to pass them to create the PKI structure, so we use empty strings */
-    UA_ByteString emptyCert = UA_BYTESTRING_NULL;
-    UA_ByteString emptyKey = UA_BYTESTRING_NULL;
-    
-    /* First, set up basic config without security policies */
     retval = UA_ServerConfig_setMinimal(config, 4840, NULL);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -427,7 +411,6 @@ int main(int argc, char* argv[]) {
                 (int)storePath.length, storePath.data);
 
     /* Ensure all PKI directories exist physically on disk */
-    /* Access FileCertStore context structures to get all directory paths */
     typedef struct {
         UA_CertificateGroup *store;
         #ifdef __linux__
@@ -443,7 +426,6 @@ int main(int argc, char* argv[]) {
         UA_String rootFolder;
     } FileCertStore;
     
-    /* Helper function to create directory from UA_String */
     char dirPath[4096] = {0};
     #define CREATE_DIR_FROM_STRING(str) do { \
         if((str).length > 0) { \
@@ -457,7 +439,6 @@ int main(int argc, char* argv[]) {
         } \
     } while(0)
     
-    /* Create all directories for Application Certificates (secureChannelPKI) */
     if(config->secureChannelPKI.context) {
         FileCertStore *applContext = (FileCertStore *)config->secureChannelPKI.context;
         
@@ -469,7 +450,6 @@ int main(int argc, char* argv[]) {
         CREATE_DIR_FROM_STRING(applContext->ownKeyFolder);
     }
     
-    /* Create all directories for User Token Certificates (sessionPKI) */
     if(config->sessionPKI.context) {
         FileCertStore *userTokenContext = (FileCertStore *)config->sessionPKI.context;
         
@@ -482,8 +462,6 @@ int main(int argc, char* argv[]) {
     #undef CREATE_DIR_FROM_STRING
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
-    /* Add PQC policy to server with filestore support */
-    /* Initialize policies array */
     config->securityPoliciesSize = 0;
     config->securityPolicies = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
     if(!config->securityPolicies) {
@@ -493,7 +471,6 @@ int main(int argc, char* argv[]) {
     }
     memset(config->securityPolicies, 0, sizeof(UA_SecurityPolicy));
 
-    /* First create the inner PQC policy */
     UA_SecurityPolicy *innerPqcPolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
     if(!innerPqcPolicy) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -524,9 +501,7 @@ int main(int argc, char* argv[]) {
     config->securityPoliciesSize = 1;
 #endif
 
-    /* Adds the None policy to the security policy list, but does not provide a None endpoint.
-     * This enables a client to retrieve the server certificate and
-     * all endpoints offered by a server. */
+    /* Add None policy for discovery only (no None endpoint) */
     if(onlySecure && allowDiscovery) {
         retval = UA_ServerConfig_addSecurityPolicyNone(config, &certificate);
         if(retval != UA_STATUSCODE_GOOD) {
@@ -538,7 +513,6 @@ int main(int argc, char* argv[]) {
         config->securityPolicyNoneDiscoveryOnly = true;
     }
 
-    /* Add endpoints for all security policies, including PQC */
     retval = UA_ServerConfig_addAllEndpoints(config);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -578,14 +552,9 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    /* Check retval before cleaning up resources */
-    if(retval != UA_STATUSCODE_GOOD)
+    if(retval != UA_STATUSCODE_GOOD || !running)
         goto cleanup;
-
-    if(!running)
-        goto cleanup; /* received ctrl-c already */
     
-    /* Certificate and privateKey are no longer needed after server initialization */
     UA_ByteString_clear(&certificate);
     UA_ByteString_clear(&privateKey);
     
@@ -593,7 +562,6 @@ int main(int argc, char* argv[]) {
 
  cleanup:
     UA_Server_delete(server);
-    /* Certificate and privateKey are already cleared above, don't clear again */
     UA_String_clear(&storePath);
     return retval == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -48,7 +48,6 @@ static bool fileExists(const char *path) {
 }
 
 /* Ensure directory exists, creating it recursively if needed */
-/* This function is identical to the one in server_encryption.c */
 static UA_StatusCode ensureDirectoryExists(const char *dirPath) {
     if(!dirPath) {
         return UA_STATUSCODE_BADINVALIDARGUMENT;
@@ -162,10 +161,7 @@ int main(int argc, char* argv[]) {
                          pkiPathArg);
             return EXIT_FAILURE;
         }
-        /* OWNERSHIP FIX: Use UA_String_fromChars to create an owning copy on the heap.
-         * UA_STRING() creates a non-owning reference to stack memory (argv), which cannot
-         * be safely freed. UA_String_fromChars() allocates a heap copy that must be
-         * cleaned up with UA_String_clear(). */
+        /* Use UA_String_fromChars to create an owning heap copy (required for UA_String_clear) */
         clientStorePath = UA_String_fromChars(pkiPathArg);
         if(clientStorePath.length == 0) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -183,14 +179,12 @@ int main(int argc, char* argv[]) {
     }
 
     /* Build paths to own certificate and private key in PKI */
-    /* Standard PKI structure: {storePath}/ApplCerts/own/{certs,private} */
     char certPath[4096], keyPath[4096];
     snprintf(certPath, sizeof(certPath), "%.*s/ApplCerts/own/certs/client_cert.der",
              (int)clientStorePath.length, clientStorePath.data);
     snprintf(keyPath, sizeof(keyPath), "%.*s/ApplCerts/own/private/client_key.der",
              (int)clientStorePath.length, clientStorePath.data);
     
-    /* Ensure PKI structure exists and verify client certificate is available */
     /* Create PKI directory structure */
     char rootDir[4096];
     char applCertsDir[4096];
@@ -208,7 +202,6 @@ int main(int argc, char* argv[]) {
     snprintf(issuerCrlDir, sizeof(issuerCrlDir), "%.*s/ApplCerts/issuer/crl", (int)clientStorePath.length, clientStorePath.data);
     snprintf(trustedDir, sizeof(trustedDir), "%.*s/ApplCerts/trusted", (int)clientStorePath.length, clientStorePath.data);
     
-    /* Create PKI directory structure */
     UA_StatusCode dirStatus = ensureDirectoryExists(rootDir);
     if(dirStatus != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -309,12 +302,10 @@ int main(int argc, char* argv[]) {
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                "[FILESTORE] Loaded client certificate and key from PKI: %s", certPath);
 
-
     UA_Client *client = UA_Client_new();
     if(!client) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                     "Failed to create client.");
-        /* Clean up resources before exiting */
         UA_ByteString_clear(&certificate);
         UA_ByteString_clear(&privateKey);
         UA_String_clear(&clientStorePath);
@@ -344,14 +335,11 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* Log PKI initialization */
     UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
                 "[FILESTORE] PKI initialized at %.*s",
                 (int)clientStorePath.length, clientStorePath.data);
 
     /* Ensure all PKI directories exist physically on disk */
-    /* This uses the same logic as the server to create the complete PKI tree */
-    /* Access FileCertStore context structures to get all directory paths */
     typedef struct {
         UA_CertificateGroup *store;
         #ifdef __linux__
@@ -399,7 +387,6 @@ int main(int argc, char* argv[]) {
 
 #ifdef UA_ENABLE_ENCRYPTION_OPENSSL
     /* Replace default policy with PQC with filestore support */
-    /* First, replace securityPolicies */
     if(cc->securityPolicies) {
         for(size_t i = 0; i < cc->securityPoliciesSize; i++) {
             cc->securityPolicies[i].clear(&cc->securityPolicies[i]);
@@ -409,7 +396,6 @@ int main(int argc, char* argv[]) {
         cc->securityPoliciesSize = 0;
     }
 
-    /* First create the inner PQC policy */
     UA_SecurityPolicy *innerPqcPolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
     if(!innerPqcPolicy) {
         UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -467,16 +453,12 @@ int main(int argc, char* argv[]) {
         UA_Client_delete(client);
         return EXIT_FAILURE;
     }
-    
-    /* Note: authSecurityPolicies will be configured AFTER UA_ClientConfig_setAuthenticationCert
-     * (if serverCertFile is provided) because that function reconfigures authSecurityPolicies */
 #endif
 
-    /* Secure client connect */
-    cc->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT; /* require encryption */
+    cc->securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
     cc->securityPolicyUri = UA_String_fromChars("http://example.org/SecurityPolicy#PQC");
     cc->endpoint.securityPolicyUri = UA_String_fromChars("http://example.org/SecurityPolicy#PQC");
-    cc->endpoint.securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT; /* ensure endpoint has the correct security mode */
+    cc->endpoint.securityMode = UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
 
     /* This demonstrates how to create a direct endpoint in the client configuration.
      * This enables connection to a server that does not include the 'None' policy
@@ -523,12 +505,9 @@ int main(int argc, char* argv[]) {
         cc->endpoint.userIdentityTokens[0].policyId = UA_String_fromChars("open62541-certificate-policy-sign+encrypt#PQC");
         cc->endpoint.userIdentityTokens[0].securityPolicyUri = UA_String_fromChars("http://example.org/SecurityPolicy#PQC");
 
-        /* UA_ClientConfig_setAuthenticationCert will reconfigure authSecurityPolicies
-         * with standard policies, so we need to replace them with PQC AFTER this call */
         UA_ClientConfig_setAuthenticationCert(cc, certificate, privateKey);
         
-        /* Replace authSecurityPolicies with PQC with filestore AFTER UA_ClientConfig_setAuthenticationCert
-         * because that function reconfigures authSecurityPolicies with standard policies */
+        /* Replace authSecurityPolicies with PQC (after setAuthenticationCert reconfigures them) */
         if(cc->authSecurityPolicies) {
             for(size_t i = 0; i < cc->authSecurityPoliciesSize; i++) {
                 cc->authSecurityPolicies[i].clear(&cc->authSecurityPolicies[i]);
@@ -538,7 +517,6 @@ int main(int argc, char* argv[]) {
             cc->authSecurityPoliciesSize = 0;
         }
 
-        /* Create inner PQC policy for auth */
         UA_SecurityPolicy *innerAuthPqcPolicy = (UA_SecurityPolicy *)UA_malloc(sizeof(UA_SecurityPolicy));
         if(!innerAuthPqcPolicy) {
             UA_LOG_FATAL(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND,
@@ -666,7 +644,6 @@ int main(int argc, char* argv[]) {
 
     retval = UA_Client_connect(client, endpointUrl);
     if(retval != UA_STATUSCODE_GOOD) {
-        /* Clean up resources before exiting */
         UA_ByteString_clear(&certificate);
         UA_ByteString_clear(&privateKey);
         UA_String_clear(&clientStorePath);
@@ -680,7 +657,6 @@ int main(int argc, char* argv[]) {
     UA_Variant value;
     UA_Variant_init(&value);
 
-    /* NodeId of the variable holding the current time */
     const UA_NodeId nodeId = UA_NS0ID(SERVER_SERVERSTATUS_CURRENTTIME);
     retval = UA_Client_readValueAttribute(client, nodeId, &value);
 
@@ -688,7 +664,6 @@ int main(int argc, char* argv[]) {
        UA_Variant_hasScalarType(&value, &UA_TYPES[UA_TYPES_DATETIME])) {
         UA_DateTime raw_date = *(UA_DateTime *)value.data;
         UA_DateTimeStruct dts = UA_DateTime_toStruct(raw_date);
-        /* Check return values to handle broken pipe gracefully */
         int result1 = fprintf(stdout, "\n");
         int result2 = fprintf(stdout, "═══════════════════════════════════════════════════════════════\n");
         int result3 = fprintf(stdout, "SUCCESS: Received server value\n");
@@ -709,7 +684,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* Clean up */
     UA_Variant_clear(&value);
     UA_Client_delete(client);
     UA_ByteString_clear(&certificate);
