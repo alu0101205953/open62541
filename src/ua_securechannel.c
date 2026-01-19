@@ -947,7 +947,7 @@ UA_SecureChannel_sendAsymmetricOPNMessage(UA_SecureChannel *channel,
      * prependHeadersAsym will calculate the encryptedLength based on this. */
     total_length = payload_length + sigsize;
     
-    UA_LOG_WARNING(channel->securityPolicy->logger, UA_LOGCATEGORY_SECURITY,
+    UA_LOG_DEBUG(channel->securityPolicy->logger, UA_LOGCATEGORY_SECURITY,
         "DEBUG SECSTATE: channel->securityPolicy=%.*s channel->securityMode=%d "
         "payload.securityMode=%d channel->state=%d",
         (int)channel->securityPolicy->policyUri.length,

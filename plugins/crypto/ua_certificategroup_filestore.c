@@ -455,9 +455,41 @@ reloadAndWriteTrustStore(UA_CertificateGroup *certGroup) {
         dummyCert.data = (UA_Byte*)UA_malloc(1);
         if(dummyCert.data) {
             dummyCert.data[0] = 0x00; /* Invalid certificate - will fail parsing but trigger reload */
+            
+            /* Save rejectedList size before calling verifyCertificate */
+            /* The dummyCert may be added to rejectedList as a side effect */
+            size_t rejectedListSizeBefore = memStore->rejectedCertificatesSize;
+            
             /* This call will: 1) Check reloadRequired=true, 2) Call reloadCertificates, 3) Fail on parsing */
             /* The failure is expected and harmless - we just need reloadCertificates to run */
             (void)context->store->verifyCertificate(context->store, &dummyCert);
+            
+            /* Remove dummyCert from rejectedList if it was added as a side effect */
+            /* The dummyCert is not a real certificate and should not be persisted */
+            if(memStore->rejectedCertificatesSize > rejectedListSizeBefore) {
+                /* Search for dummyCert in rejectedList (search from end, as appendCopy adds at the end) */
+                for(size_t i = memStore->rejectedCertificatesSize; i > 0; i--) {
+                    size_t idx = i - 1;
+                    if(memStore->rejectedCertificates[idx].length == 1 &&
+                       memStore->rejectedCertificates[idx].data &&
+                       memStore->rejectedCertificates[idx].data[0] == 0x00) {
+                        /* Found dummyCert - remove it by moving last element to this position and resizing */
+                        UA_ByteString_clear(&memStore->rejectedCertificates[idx]);
+                        if(idx < memStore->rejectedCertificatesSize - 1) {
+                            /* Move last element to dummyCert's position */
+                            memStore->rejectedCertificates[idx] = memStore->rejectedCertificates[memStore->rejectedCertificatesSize - 1];
+                            UA_ByteString_init(&memStore->rejectedCertificates[memStore->rejectedCertificatesSize - 1]);
+                        }
+                        /* Resize array to remove last element */
+                        UA_Array_resize((void**)&memStore->rejectedCertificates,
+                                       &memStore->rejectedCertificatesSize,
+                                       memStore->rejectedCertificatesSize - 1,
+                                       &UA_TYPES[UA_TYPES_BYTESTRING]);
+                        break;
+                    }
+                }
+            }
+            
             UA_free(dummyCert.data);
             if(logger) {
                 UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
