@@ -86,6 +86,30 @@ We want to foster an open and welcoming community. Please take our [code of cond
 
 ## Build System, Code Structure and Dependencies
 
+To build the project:
+
+mkdir build && cd build
+
+cmake ..
+
+make
+
+ccmake ..
+
+Then select UA_BUILD_EXAMPLES -> ON and UA_ENABLE_ENCRYPTION -> OPENSSL
+
+[c]onfigure, then [g]enerate
+
+make -j4 all
+
+---
+
+To start the server: ./build/bin/examples/server_encryption --onlySecure --allowDiscovery --pki ./server_pki
+
+To start the client: ./build/bin/examples/client_encryption opc.tcp://<YOUR_IP>:4840 --pki ./client_pki
+
+---
+
 The build environment of open62541 is generated via CMake. See the [build documentation](https://www.open62541.org/doc/master/building.html) for details.
 To simplify the integration with existing software projects, the open62541 sources can be compressed (amalgamated) into a single-file-distribution, a pair of `open62541.c/.h` files.
 The functionality included in the single-file-distribution depends on the current CMake configuration.
@@ -210,3 +234,6 @@ int main(int argc, char *argv[])
     return status == UA_STATUSCODE_GOOD ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 ```
+
+
+
