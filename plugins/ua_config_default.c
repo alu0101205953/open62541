@@ -22,6 +22,9 @@
 #include <open62541/plugin/certificategroup_default.h>
 #include <open62541/plugin/securitypolicy_default.h>
 #include <open62541/server_config_default.h>
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+#include <open62541/plugin/securitypolicy_pqc.h>
+#endif
 
 #include "../deps/mp_printf.h"
 
@@ -908,6 +911,43 @@ addAllSecurityPolicies(UA_SecurityPolicy *sp, size_t *length,
                        const UA_ByteString certificate, const UA_ByteString privateKey,
                        UA_Boolean onlySecure, UA_ApplicationType applicationType,
                        UA_Logger *logging) {
+    /* Check if certificate is PQC (has PQC extensions).
+     * If so, skip RSA/ECC policies as they are incompatible with PQC-only certificates. */
+    UA_Boolean isPQCCert = UA_FALSE;
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+    if(certificate.length > 0 && certificate.data) {
+        isPQCCert = UA_PQC_HasCertificatePQCExtensions(&certificate, logging);
+    }
+#endif
+
+    /* For PQC certificates, only add PQC policy and SecurityPolicy#None.
+     * Skip RSA/ECC policies as they require RSA/ECC keys which are not available in PQC-only certificates. */
+    if(isPQCCert) {
+        /* Kyber768+Dilithium2 */
+        UA_StatusCode retval = UA_SecurityPolicy_PQC(sp + *length, certificate, privateKey, logging);
+        *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(logging, UA_LOGCATEGORY_USERLAND,
+                           "Could not add SecurityPolicy#PQC with error code %s",
+                           UA_StatusCode_name(retval));
+        }
+        
+        /* Don't add "unsecure" SecurityPolicies */
+        if(onlySecure)
+            return;
+        
+        /* None */
+        retval = UA_SecurityPolicy_None(sp + *length, certificate, logging);
+        *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
+        if(retval != UA_STATUSCODE_GOOD) {
+            UA_LOG_WARNING(logging, UA_LOGCATEGORY_USERLAND,
+                           "Could not add SecurityPolicy#None with error code %s",
+                           UA_StatusCode_name(retval));
+        }
+        return;
+    }
+
+    /* For non-PQC certificates, add all standard policies */
     /* Basic256Sha256 */
     UA_StatusCode retval = UA_SecurityPolicy_Basic256Sha256(sp + *length, certificate, privateKey, logging);
     *length += (retval == UA_STATUSCODE_GOOD) ? 1 : 0;
@@ -1946,6 +1986,109 @@ UA_ClientConfig_setDefaultEncryption(UA_ClientConfig *config,
     return UA_STATUSCODE_GOOD;
 }
 #endif
+
+#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
+
+UA_StatusCode
+UA_ClientConfig_setDefaultWithFilestore(UA_ClientConfig *config,
+                                        const UA_ByteString *localCertificate,
+                                        const UA_ByteString *privateKey,
+                                        const UA_String storePath) {
+    UA_StatusCode retval = UA_ClientConfig_setDefault(config);
+    if(retval != UA_STATUSCODE_GOOD) {
+        return retval;
+    }
+
+    if(!storePath.data) {
+        UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_USERLAND,
+                     "The path to a PKI folder has not been specified");
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+    }
+
+    UA_KeyValuePair params[2];
+    size_t paramsSize = 2;
+
+    params[0].key = UA_QUALIFIEDNAME(0, "max-trust-listsize");
+    UA_Variant_setScalar(&params[0].value, &config->maxTrustListSize,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+    params[1].key = UA_QUALIFIEDNAME(0, "max-rejected-listsize");
+    UA_Variant_setScalar(&params[1].value, &config->maxRejectedListSize,
+                         &UA_TYPES[UA_TYPES_UINT32]);
+
+    UA_KeyValueMap paramsMap;
+    paramsMap.map = params;
+    paramsMap.mapSize = paramsSize;
+
+    if(config->certificateVerification.clear)
+        config->certificateVerification.clear(&config->certificateVerification);
+
+    UA_NodeId defaultApplicationGroup =
+        UA_NS0ID(SERVERCONFIGURATION_CERTIFICATEGROUPS_DEFAULTAPPLICATIONGROUP);
+    retval = UA_CertificateGroup_Filestore(&config->certificateVerification,
+                                           &defaultApplicationGroup,
+                                           storePath,
+                                           config->logging,
+                                           &paramsMap);
+    if(retval != UA_STATUSCODE_GOOD)
+        return retval;
+    
+    UA_ByteString decryptedPrivateKey = UA_BYTESTRING_NULL;
+    UA_ByteString keyPassword = UA_BYTESTRING_NULL;
+    UA_StatusCode keySuccess = UA_STATUSCODE_GOOD;
+
+    /* Check if this is a PQC certificate (has PQC extensions) */
+    UA_Boolean isPQCCert = UA_FALSE;
+#ifdef UA_ENABLE_ENCRYPTION_OPENSSL
+    if(localCertificate && localCertificate->length > 0) {
+        isPQCCert = UA_PQC_HasCertificatePQCExtensions(localCertificate, config->logging);
+    }
+#endif
+
+    /* For PQC certificates, check if the private key is in PQC-only format (4960 bytes raw) */
+    if(isPQCCert && privateKey && privateKey->length == 4960) {
+        /* PQC-only format: raw binary blob, no PEM/DER encoding
+         * Pass the key directly without OpenSSL parsing */
+        keySuccess = UA_ByteString_copy(privateKey, &decryptedPrivateKey);
+        if(keySuccess != UA_STATUSCODE_GOOD) {
+            UA_LOG_ERROR(config->logging, UA_LOGCATEGORY_USERLAND,
+                         "Failed to copy PQC-only private key");
+            return keySuccess;
+        }
+    } else {
+        /* Traditional certificate: use OpenSSL to decrypt/parse the key */
+        if(privateKey && privateKey->length > 0)
+            keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword,
+                                                               &decryptedPrivateKey);
+
+        /* Get the password and decrypt. An application might want to loop / retry
+         * here to allow users to correct their entry. */
+        if(keySuccess != UA_STATUSCODE_GOOD) {
+            if(config->privateKeyPasswordCallback)
+                keySuccess = config->privateKeyPasswordCallback(config, &keyPassword);
+            else
+                keySuccess = readPrivateKeyPassword(&keyPassword);
+            if(keySuccess != UA_STATUSCODE_GOOD)
+                return keySuccess;
+            keySuccess = UA_CertificateUtils_decryptPrivateKey(*privateKey, keyPassword, &decryptedPrivateKey);
+            UA_ByteString_memZero(&keyPassword);
+            UA_ByteString_clear(&keyPassword);
+        }
+    }
+    if(keySuccess != UA_STATUSCODE_GOOD)
+        return keySuccess;
+
+    if(localCertificate && localCertificate->length > 0) {
+        clientConfig_setSecurityPolicies(config, *localCertificate, decryptedPrivateKey);
+        clientConfig_setAuthenticationSecurityPolicies(config, *localCertificate, decryptedPrivateKey);
+    }
+
+    UA_ByteString_memZero(&decryptedPrivateKey);
+    UA_ByteString_clear(&decryptedPrivateKey);
+
+    return UA_STATUSCODE_GOOD;
+}
+
+#endif /* defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) */
 
 #if defined(UA_ENABLE_ENCRYPTION_OPENSSL) || defined(UA_ENABLE_ENCRYPTION_MBEDTLS)
 UA_StatusCode

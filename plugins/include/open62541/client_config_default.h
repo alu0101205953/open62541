@@ -30,6 +30,14 @@ UA_ClientConfig_setDefaultEncryption(UA_ClientConfig *config,
                                      UA_ByteString localCertificate, UA_ByteString privateKey,
                                      const UA_ByteString *trustList, size_t trustListSize,
                                      const UA_ByteString *revocationList, size_t revocationListSize);
+
+#if defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__)
+UA_StatusCode UA_EXPORT
+UA_ClientConfig_setDefaultWithFilestore(UA_ClientConfig *config,
+                                        const UA_ByteString *localCertificate,
+                                        const UA_ByteString *privateKey,
+                                        const UA_String storePath);
+#endif /* defined(__linux__) || defined(UA_ARCHITECTURE_WIN32) || defined(__APPLE__) */
 #endif
 
 _UA_END_DECLS

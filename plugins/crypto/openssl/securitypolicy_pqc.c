@@ -95,6 +95,13 @@ typedef struct {
     
     /* Track if we've generated symmetric keys before (for canonical nonce ordering) */
     UA_Boolean hasGeneratedSymmetricKeys; /* True if we've generated symmetric keys at least once */
+    
+    /* Reference counting: tracks how many PQC_ChannelContext instances reference this policy.
+     * The policy can only be freed when refCount == 0.
+     * Thread-safety: Operations on security policies are executed within the EventLoop context,
+     * which provides serialization guarantees. Channel creation/deletion happens during
+     * secure channel setup/teardown, which is also serialized by the framework. */
+    UA_UInt32 refCount; /* Number of active channel contexts referencing this policy */
 } Policy_Context_PQC;
 
 typedef struct {
@@ -216,8 +223,6 @@ pqc_init_keys(Policy_Context_PQC *ctx) {
 
     if(OQS_SIG_keypair(sig, ctx->sigPublicKey, ctx->sigPrivateKey) == OQS_SUCCESS) {
         ctx->sigKeysInitialized = true;
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
-                    "Generated Dilithium keypair");
     }
     OQS_SIG_free(sig);
 }
@@ -260,16 +265,11 @@ pqc_init_kem_keys(Policy_Context_PQC *ctx) {
         /* Las claves públicas ya están extraídas del certificado.
          * Verificar si las claves privadas ya están cargadas. */
         UA_Boolean hasPrivateKey = !pqc_is_buffer_all_zeros(ctx->kemPrivateKey, sizeof(ctx->kemPrivateKey));
-        if(log) {
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
-                        "pqc_init_kem_keys: Public key found, checking private key (hasPrivateKey=%u, kemKeysInitialized=%u)",
-                        (unsigned)hasPrivateKey, (unsigned)ctx->kemKeysInitialized);
-        }
         if(hasPrivateKey) {
             /* Las claves privadas ya están cargadas, marcar como inicializado */
             ctx->kemKeysInitialized = true;
             if(log) {
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                             "pqc_init_kem_keys: Kyber keys already initialized "
                             "(public key from certificate, private key already loaded)");
             }
@@ -277,7 +277,7 @@ pqc_init_kem_keys(Policy_Context_PQC *ctx) {
         } else {
             /* Las claves públicas están extraídas pero las privadas no están cargadas aún */
             if(log) {
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                             "pqc_init_kem_keys: Kyber public key already extracted from certificate, "
                             "waiting for private key to be loaded");
             }
@@ -296,8 +296,6 @@ pqc_init_kem_keys(Policy_Context_PQC *ctx) {
 
     if(OQS_KEM_keypair(kem, ctx->kemPublicKey, ctx->kemPrivateKey) == OQS_SUCCESS) {
         ctx->kemKeysInitialized = true;
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
-                    "Generated Kyber keypair (no certificate provided)");
     }
     OQS_KEM_free(kem);
 }
@@ -529,7 +527,7 @@ UA_PQC_EnsureCertificateExtensions(UA_ByteString *certificate,
     if(objKy && X509_get_ext_by_OBJ(x509, objKy, -1) >= 0)
         hasKyberExt = true;
     
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQC_EnsureCertificateExtensions: checking certificate for PQC extensions "
                 "(hasDilithiumExt=%u, hasKyberExt=%u, certificate length=%zu bytes)",
                 (unsigned)hasDilithiumExt, (unsigned)hasKyberExt, certificate->length);
@@ -551,7 +549,7 @@ UA_PQC_EnsureCertificateExtensions(UA_ByteString *certificate,
          * en lugar de generar nuevas. Sin embargo, si el signingPrivateKey ya contiene
          * claves PQC, debemos verificar que correspondan a las claves públicas del certificado.
          * Si no corresponden, generamos nuevas claves y sobrescribimos las extensiones. */
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_EnsureCertificateExtensions: certificate already has PQC extensions, "
                     "extracting existing public keys");
         
@@ -579,7 +577,7 @@ UA_PQC_EnsureCertificateExtensions(UA_ByteString *certificate,
             uint8_t existingSigKey[OQS_SIG_dilithium_2_length_secret_key];
             uint8_t existingKemKey[OQS_KEM_kyber_768_length_secret_key];
             
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                         "UA_PQC_EnsureCertificateExtensions: found PQC private keys in buffer "
                         "(buffer length=%zu, offset=%zu, sigKeyLen=%zu, kemKeyLen=%zu)",
                         signingPrivateKey->length, offset, sigKeyLen, kemKeyLen);
@@ -607,7 +605,7 @@ UA_PQC_EnsureCertificateExtensions(UA_ByteString *certificate,
                             tempCtx.sigKeysInitialized = true;
                             tempCtx.kemKeysInitialized = true;
                             
-                            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                                         "UA_PQC_EnsureCertificateExtensions: existing private keys match certificate public keys, "
                                         "using existing keys");
                             OQS_KEM_free(kem);
@@ -631,7 +629,7 @@ UA_PQC_EnsureCertificateExtensions(UA_ByteString *certificate,
             }
             
             /* Las claves no coinciden o no se pudieron verificar. Generar nuevas claves. */
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                         "UA_PQC_EnsureCertificateExtensions: generating new keys to replace mismatched keys");
             modified = true; /* Marcar como modificado para sobrescribir las extensiones */
         } else {
@@ -696,7 +694,7 @@ keys_ready:
         }
     } else {
         /* El certificado no tiene extensiones PQC. Generar nuevas claves. */
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_EnsureCertificateExtensions: certificate does not have PQC extensions, "
                     "generating new keys");
         
@@ -796,11 +794,11 @@ keys_ready:
     EVP_PKEY_free(pkey);
     
     if(modified) {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_EnsureCertificateExtensions: embedded Dilithium and Kyber public keys into certificate (%s)",
                     certWasPem ? "PEM" : "DER");
     } else {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_EnsureCertificateExtensions: certificate already had PQC extensions, "
                     "using existing public keys (%s)", certWasPem ? "PEM" : "DER");
     }
@@ -808,7 +806,7 @@ keys_ready:
 writeback:
     status = pqc_write_back_certificate(x509, certWasPem, certificate);
     if(status == UA_STATUSCODE_GOOD) {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_EnsureCertificateExtensions: certificate written back successfully (new length=%zu bytes)",
                     certificate->length);
         
@@ -883,7 +881,7 @@ writeback:
         
         if(isDilithiumKey) {
             /* New format: certificate is signed with Dilithium, so only append Kyber private key */
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                         "UA_PQC_EnsureCertificateExtensions: preparing to append Kyber private key "
                         "(certificate signed with Dilithium, original length=%zu, Kyber=%zu bytes, new total=%zu bytes)",
                         origLen, kemKeyLen, newLen);
@@ -893,7 +891,7 @@ writeback:
                 /* Copy only Kyber private key to the end of the buffer */
                 memcpy(signingPrivateKey->data + origLen, tempCtx.kemPrivateKey, kemKeyLen);
                 
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                             "UA_PQC_EnsureCertificateExtensions: ✓ appended Kyber private key to signingPrivateKey "
                             "(Kyber=%zu bytes at offset %zu, new total=%zu bytes, format=Dilithium+Kyber)",
                             kemKeyLen, origLen, signingPrivateKey->length);
@@ -907,7 +905,7 @@ writeback:
             keysToAppend = sigKeyLen + kemKeyLen;
             newLen = origLen + keysToAppend;
             
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                         "UA_PQC_EnsureCertificateExtensions: preparing to append PQC private keys "
                         "(legacy format: RSA/ECC + PQC, original length=%zu, Dilithium=%zu bytes, "
                         "Kyber=%zu bytes, new total=%zu bytes)",
@@ -919,7 +917,7 @@ writeback:
                 memcpy(signingPrivateKey->data + origLen, tempCtx.sigPrivateKey, sigKeyLen);
                 memcpy(signingPrivateKey->data + origLen + sigKeyLen, tempCtx.kemPrivateKey, kemKeyLen);
                 
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                             "UA_PQC_EnsureCertificateExtensions: ✓ appended PQC private keys to signingPrivateKey "
                             "(Dilithium=%zu bytes at offset %zu, Kyber=%zu bytes at offset %zu, new total=%zu bytes, "
                             "format=RSA/ECC+Dilithium+Kyber)",
@@ -1098,7 +1096,7 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
         }
     }
 
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQC_CreateCertificateWithOQSProvider: OQS Provider loaded successfully");
 
     /* Generate Dilithium key using OQS Provider */
@@ -1137,7 +1135,7 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
     }
     
     if(usedAlgorithm && strcmp(usedAlgorithm, pqcSigAlgorithm) != 0) {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_CreateCertificateWithOQSProvider: Using algorithm name '%s' instead of '%s'",
                     usedAlgorithm, pqcSigAlgorithm);
     }
@@ -1156,7 +1154,7 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
         goto cleanup;
     }
 
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQC_CreateCertificateWithOQSProvider: Generated %s key successfully", pqcSigAlgorithm);
 
     /* Create certificate */
@@ -1260,7 +1258,7 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
         goto cleanup;
 
     /* Generate Kyber key for KEM (still using OQS library directly) */
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQC_CreateCertificateWithOQSProvider: Generating Kyber768 keypair for KEM");
     pqc_init_kem_keys(&tempCtx);
 
@@ -1303,12 +1301,12 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
             errRet = UA_STATUSCODE_BADINTERNALERROR;
             goto cleanup;
         } else {
-            UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                         "UA_PQC_CreateCertificateWithOQSProvider: Certificate signed successfully with %s using SHA-256",
                         pqcSigAlgorithm);
         }
     } else {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_CreateCertificateWithOQSProvider: Certificate signed successfully with %s (no external hash required)",
                     pqcSigAlgorithm);
     }
@@ -1372,7 +1370,7 @@ UA_PQC_CreateCertificateWithOQSProvider(const UA_Logger *logger,
     memcpy(outPrivateKey->data + origLen, tempCtx.kemPrivateKey, kemKeyLen);
     outPrivateKey->length = newLen;
 
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQC_CreateCertificateWithOQSProvider: ✓ Certificate created successfully "
                 "(cert=%zu bytes, key=%zu bytes, format=%s, signed with %s)",
                 outCertificate->length, outPrivateKey->length,
@@ -1623,7 +1621,7 @@ UA_PQC_HasCertificatePQCExtensions(const UA_ByteString *certificate, const UA_Lo
     UA_Boolean hasPQCExtensions = (hasDilithiumExt && hasKyberExt);
     
     if(hasPQCExtensions) {
-        UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_PQC_HasCertificatePQCExtensions: Certificate has PQC extensions "
                     "(Dilithium=%u, Kyber=%u) - PQC operations will be used",
                     (unsigned)hasDilithiumExt, (unsigned)hasKyberExt);
@@ -1635,6 +1633,85 @@ UA_PQC_HasCertificatePQCExtensions(const UA_ByteString *certificate, const UA_Lo
     }
 
     return hasPQCExtensions;
+}
+
+UA_EXPORT UA_StatusCode
+UA_PQC_VerifyCertificateSignature(const UA_ByteString *certificate, void *issuerCert, const UA_Logger *logger) {
+    X509 *issuer = (X509 *)issuerCert;
+    if(!certificate || certificate->length == 0 || !certificate->data)
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    const UA_Logger *log = logger ? logger : UA_Log_Stdout;
+
+    UA_Boolean certWasPem = UA_FALSE;
+    X509 *x509 = pqc_parse_x509_from_bytes(certificate, &certWasPem);
+    if(!x509) {
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Failed to parse certificate");
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    }
+
+    int verifyResult = -1;
+    EVP_PKEY *issuerPubkey = NULL;
+    
+    if(issuer) {
+        /* Verify using issuer CA's public key (for CA-signed certificates) */
+        issuerPubkey = X509_get0_pubkey(issuer);
+        if(!issuerPubkey) {
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Failed to get issuer public key");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+        verifyResult = X509_verify(x509, issuerPubkey);
+    } else {
+        /* Self-signed verification: check if subject == issuer */
+        X509_NAME *subject = X509_get_subject_name(x509);
+        X509_NAME *issuer = X509_get_issuer_name(x509);
+        if(!subject || !issuer) {
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Failed to get subject/issuer name");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+        
+        if(X509_NAME_cmp(subject, issuer) == 0) {
+            /* Self-signed: verify using certificate's own public key */
+            EVP_PKEY *selfPubkey = X509_get_pubkey(x509);
+            if(selfPubkey) {
+                verifyResult = X509_verify(x509, selfPubkey);
+                EVP_PKEY_free(selfPubkey);
+            } else {
+                UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                               "UA_PQC_VerifyCertificateSignature: Failed to get certificate public key");
+                X509_free(x509);
+                return UA_STATUSCODE_BADCERTIFICATEINVALID;
+            }
+        } else {
+            /* Not self-signed but no issuer provided */
+            UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                           "UA_PQC_VerifyCertificateSignature: Certificate is not self-signed but no issuer provided");
+            X509_free(x509);
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
+        }
+    }
+    
+    X509_free(x509);
+
+    if(verifyResult == 1) {
+        /* Signature is valid */
+        return UA_STATUSCODE_GOOD;
+    } else if(verifyResult == 0) {
+        /* Signature verification failed */
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Signature verification failed");
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    } else {
+        /* Error during verification */
+        UA_LOG_WARNING(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                       "UA_PQC_VerifyCertificateSignature: Error during signature verification (OpenSSL error)");
+        return UA_STATUSCODE_BADCERTIFICATEINVALID;
+    }
 }
 
 /* ---------------------- Create CSR with PQC keys -------------------- */
@@ -1697,7 +1774,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
     keyCtx = NULL;
     
     /* Generate Kyber keys */
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Generating Kyber keys...");
     pqc_init_kem_keys(&tempCtx);
     if(!tempCtx.kemKeysInitialized) {
@@ -1707,7 +1784,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
                     "UA_PQC_CreateCSR: Failed to generate Kyber keys");
         return UA_STATUSCODE_BADINTERNALERROR;
     }
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Kyber keys generated, creating CSR structure...");
     
     /* Create CSR */
@@ -1756,7 +1833,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
         errRet = UA_STATUSCODE_BADINTERNALERROR;
         goto cleanup;
     }
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Public key set, adding extensions...");
     
     /* Add extensions */
@@ -1818,13 +1895,13 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
     if(objKy) ASN1_OBJECT_free(objKy);
     
     /* Add extensions to CSR (X509_REQ_add_extensions takes ownership) */
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Adding extensions to CSR (%d extensions)",
                sk_X509_EXTENSION_num(exts));
     X509_REQ_add_extensions(req, exts);
     sk_X509_EXTENSION_free(exts);
     exts = NULL;
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Extensions added, signing CSR...");
     
     /* Sign CSR with Dilithium key */
@@ -1843,7 +1920,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
     }
     
     /* Write CSR to buffer */
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Serializing CSR to DER format...");
     int csrLen = i2d_X509_REQ(req, NULL);
     if(csrLen <= 0) {
@@ -1852,7 +1929,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
         errRet = UA_STATUSCODE_BADINTERNALERROR;
         goto cleanup;
     }
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: CSR length: %d bytes", csrLen);
     if(UA_ByteString_allocBuffer(outCSR, (size_t)csrLen) != UA_STATUSCODE_GOOD) {
         UA_LOG_ERROR(log, UA_LOGCATEGORY_SECURITYPOLICY,
@@ -1862,7 +1939,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
     }
     unsigned char *ptr = outCSR->data;
     i2d_X509_REQ(req, &ptr);
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: CSR serialized, writing private key...");
     
     /* Write private key (Dilithium + Kyber) */
@@ -1873,7 +1950,7 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
         errRet = UA_STATUSCODE_BADINTERNALERROR;
         goto cleanup;
     }
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Dilithium key length: %d bytes, Kyber key: %zu bytes",
                keyLen, sizeof(tempCtx.kemPrivateKey));
     size_t totalKeyLen = (size_t)keyLen + sizeof(tempCtx.kemPrivateKey);
@@ -1894,13 +1971,13 @@ UA_PQC_CreateCSR(const UA_Logger *logger,
     }
     memcpy(outPrivateKey->data + keyLen, tempCtx.kemPrivateKey, sizeof(tempCtx.kemPrivateKey));
     outPrivateKey->length = totalKeyLen;
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: Private key written successfully (total: %zu bytes)",
                totalKeyLen);
     
     /* Set errRet to GOOD before cleanup */
     errRet = UA_STATUSCODE_GOOD;
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_CreateCSR: CSR created successfully with PQC keys (CSR: %zu bytes, Key: %zu bytes)",
                outCSR->length, outPrivateKey->length);
     
@@ -2080,7 +2157,7 @@ UA_PQC_SignCSRWithCA(const UA_Logger *logger,
         return errRet;
     }
     
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_SignCSRWithCA: Certificate signed successfully by CA "
                "(OQS Provider handled Dilithium signing)");
     
@@ -2177,7 +2254,7 @@ UA_PQC_SignCertificateWithCA(const UA_Logger *logger,
         return errRet;
     }
     
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                "UA_PQC_SignCertificateWithCA: Certificate signed successfully by CA "
                "(OQS Provider handled Dilithium signing)");
     
@@ -2210,7 +2287,7 @@ UA_PQCPolicy_registerRemoteKeys(UA_SecurityPolicy *policy,
         return UA_STATUSCODE_BADINVALIDARGUMENT;
     }
 
-    UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                 "UA_PQCPolicy_registerRemoteKeys: remote keys registered (note: keys are stored per-channel)");
     
     /* Nota: Las claves remotas se almacenan en el contexto del canal (PQC_ChannelContext),
@@ -2227,10 +2304,31 @@ UA_PQCPolicy_clear(UA_SecurityPolicy *policy) {
 
     Policy_Context_PQC *ctx = (Policy_Context_PQC *)policy->policyContext;
     if(ctx) {
+        /* CRITICAL: Never free the policy context if channel contexts are still referencing it.
+         * The refCount is the single source of truth for whether the policy can be safely freed.
+         * This prevents use-after-free when channels are being cleaned up asynchronously
+         * during shutdown. */
+        if(ctx->refCount != 0) {
+            const UA_Logger *log = ctx->logger ? ctx->logger : UA_Log_Stdout;
+            UA_LOG_ERROR(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "UA_PQCPolicy_clear: Cannot free policy context: refCount=%u > 0. "
+                        "There are still active channel contexts referencing this policy. "
+                        "The policy will remain in memory until all channels are closed.",
+                        (unsigned)ctx->refCount);
+            /* Do NOT free the context. Return immediately to prevent use-after-free.
+             * The framework must ensure all channels are closed before clearing policies.
+             * Once refCount reaches 0, the policy can be safely freed. */
+            return;
+        }
+        
+        /* Only free when refCount == 0, meaning no channel contexts reference this policy */
         /* Limpiar claves privadas antes de liberar */
         memset(ctx->sigPrivateKey, 0, sizeof(ctx->sigPrivateKey));
         memset(ctx->kemPrivateKey, 0, sizeof(ctx->kemPrivateKey));
-        UA_ByteString_clear(&ctx->localCertThumbprint);
+        /* Only clear if the ByteString owns heap memory */
+        if(ctx->localCertThumbprint.data != NULL) {
+            UA_ByteString_clear(&ctx->localCertThumbprint);
+        }
         UA_free(ctx);
         policy->policyContext = NULL;
     }
@@ -2451,9 +2549,19 @@ pqc_sym_generateKey(void *policyContext,
     memcpy(seed.data, firstNonce->data, firstNonce->length);
     memcpy(seed.data + firstNonce->length, secondNonce->data, secondNonce->length);
     
-    UA_ByteString secret = {PQC_KEM_SHARED_SECRET_LEN, pc->temporarySharedSecret};
+    /* Create heap-allocated copy of embedded secret (required for UA_ByteString ownership) */
+    UA_ByteString secret;
+    UA_ByteString_init(&secret);
+    retval = UA_ByteString_allocBuffer(&secret, PQC_KEM_SHARED_SECRET_LEN);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_ByteString_clear(&seed);
+        return retval;
+    }
+    memcpy(secret.data, pc->temporarySharedSecret, PQC_KEM_SHARED_SECRET_LEN);
+    
     retval = UA_Openssl_Random_Key_PSHA256_Derive(&secret, &seed, out);
     
+    UA_ByteString_clear(&secret);
     UA_ByteString_clear(&seed);
     pc->hasGeneratedSymmetricKeys = true;
     
@@ -2505,7 +2613,7 @@ pqc_sym_encr_decrypt(void *channelContext, UA_ByteString *data) {
     PQC_ChannelContext *ctx = (PQC_ChannelContext *)channelContext;
     const UA_Logger *logger = pqc_get_logger_from_channel(ctx);
     
-    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                  "pqc_sym_encr_decrypt: Called (data->length=%zu, encKey.length=%zu, iv.length=%zu)",
                  data->length, ctx->remoteSymEncryptingKey.length, ctx->remoteSymIv.length);
     if(ctx->remoteSymEncryptingKey.length == 0 || ctx->remoteSymIv.length == 0) {
@@ -2935,11 +3043,19 @@ pqc_sign(void *context, const UA_ByteString *message, UA_ByteString *signature) 
     if(!sig) return UA_STATUSCODE_BADOUTOFMEMORY;
 
     size_t siglen = 0;
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pqc_sign: before sign alg=Dilithium2 msgLen=%zu sigBufLen=%zu",
+                message->length, signature->length);
+
     OQS_STATUS rc = OQS_SIG_sign(sig, signature->data, &siglen,
                                  message->data, message->length, pc->sigPrivateKey);
 
     signature->length = (size_t)siglen;
     OQS_SIG_free(sig);
+
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] pqc_sign: after sign alg=Dilithium2 rc=%d sigLen=%zu",
+                (int)rc, signature->length);
 
     if(rc != OQS_SUCCESS) {
         UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
@@ -2987,7 +3103,7 @@ pqc_verify(void *context, const UA_ByteString *message, const UA_ByteString *sig
         return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
     }
     
-    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                 "pqc_verify: Verifying signature (message.length=%zu, signature.length=%zu, remoteSigPublicKeyValid=%u)",
                 message->length, signature->length, (unsigned)ctx->remoteSigPublicKeyValid);
 
@@ -3071,7 +3187,7 @@ pqc_encrypt(void *context, UA_ByteString *data) {
          * Solution: Allow sending the first OPN without encryption (only signed) when the remote
          * Kyber key is not available. The server will respond with its OPN containing its certificate,
          * and subsequent messages will be encrypted. */
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                      "pqc_encrypt: remote Kyber public key is not initialized. "
                      "This is expected for the first OPN message before receiving server certificate. "
                      "Sending message without encryption (only signed). "
@@ -3192,7 +3308,7 @@ pqc_decrypt(void *context, UA_ByteString *data) {
     
     /* Log before calling pqc_init_kem_keys */
     if(logger) {
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "pqc_decrypt: Called (data->length=%zu, pc->kemKeysInitialized=%u)",
                 data->length, (unsigned)pc->kemKeysInitialized);
     }
@@ -3201,7 +3317,7 @@ pqc_decrypt(void *context, UA_ByteString *data) {
     
     /* Log after calling pqc_init_kem_keys */
     if(logger) {
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "pqc_decrypt: After pqc_init_kem_keys (pc->kemKeysInitialized=%u)",
                 (unsigned)pc->kemKeysInitialized);
     }
@@ -3335,7 +3451,7 @@ pqc_channel_newContext(const UA_SecurityPolicy *policy,
     UA_ByteString_init(&ctx->remoteSymIv);
 
     if(remoteCertificate && remoteCertificate->length > 0 && remoteCertificate->data) {
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "pqc_channel_newContext: Received remote certificate (length=%zu bytes)",
                     remoteCertificate->length);
         UA_StatusCode rc = UA_ByteString_copy(remoteCertificate, &ctx->remoteCertificate);
@@ -3356,7 +3472,7 @@ pqc_channel_newContext(const UA_SecurityPolicy *policy,
         if(rc == UA_STATUSCODE_GOOD && sigValid && kemValid) {
             ctx->remoteSigPublicKeyValid = true;
             ctx->remoteKemPublicKeyValid = true;
-            UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                         "pqc_channel_newContext: Successfully extracted remote PQC keys from certificate");
         } else {
             ctx->remoteSigPublicKeyValid = false;
@@ -3373,6 +3489,11 @@ pqc_channel_newContext(const UA_SecurityPolicy *policy,
                       (void*)remoteCertificate, remoteCertificate ? remoteCertificate->length : 0);
     }
 
+    /* Increment reference count only after all initialization is successful.
+     * This ensures that if any error occurs during initialization, the refCount
+     * remains correct and the policy won't be freed prematurely. */
+    pc->refCount++;
+    
     *ppContext = ctx;
     return UA_STATUSCODE_GOOD;
 }
@@ -3424,7 +3545,7 @@ UA_PQCChannel_updateRemoteCertificate(void *context, const UA_ByteString *remote
 
     ctx->remoteSigPublicKeyValid = sigValid;
     ctx->remoteKemPublicKeyValid = kemValid;
-    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                  "UA_PQCChannel_updateRemoteCertificate: ✓ remote PQC keys extracted successfully "
                  "(Dilithium=%u, Kyber=%u, cert length=%zu bytes)",
                  (unsigned)sigValid, (unsigned)kemValid, ctx->remoteCertificate.length);
@@ -3436,6 +3557,16 @@ pqc_channel_deleteContext(void *context) {
     if(!context)
         return;
     PQC_ChannelContext *ctx = (PQC_ChannelContext*)context;
+    
+    /* Decrement reference count and nullify policyContext pointer before cleanup.
+     * This ensures that:
+     * 1. The policy knows one less channel references it
+     * 2. No subsequent access to ctx->policyContext can occur after this point */
+    if(ctx->policyContext) {
+        ctx->policyContext->refCount--;
+        ctx->policyContext = NULL;
+    }
+    
     memset(ctx->remoteSigPublicKey, 0, sizeof(ctx->remoteSigPublicKey));
     memset(ctx->remoteKemPublicKey, 0, sizeof(ctx->remoteKemPublicKey));
     memset(ctx->sharedSecret, 0, sizeof(ctx->sharedSecret));
@@ -3556,7 +3687,7 @@ pqc_set_local_from_params(Policy_Context_PQC *ctx,
             
             if(hasPublicKey) {
                 ctx->kemKeysInitialized = true;
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                            "pqc_set_local_from_params: copied raw Kyber private key "
                            "(public key already extracted from certificate)");
             } else {
@@ -3582,7 +3713,7 @@ pqc_set_local_from_params(Policy_Context_PQC *ctx,
             if(hasSigPublicKey && hasKemPublicKey) {
                 ctx->sigKeysInitialized = true;
                 ctx->kemKeysInitialized = true;
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                            "pqc_set_local_from_params: ✓ loaded PQC-only private keys "
                            "(Dilithium=%zu bytes, Kyber=%zu bytes, total=%zu bytes, "
                            "public keys already extracted from certificate)",
@@ -3633,7 +3764,7 @@ pqc_set_local_from_params(Policy_Context_PQC *ctx,
             
             if(hasSigPublicKey && hasKemPublicKey) {
                 ctx->kemKeysInitialized = true;
-                UA_LOG_INFO(log, UA_LOGCATEGORY_SECURITYPOLICY,
+                UA_LOG_DEBUG(log, UA_LOGCATEGORY_SECURITYPOLICY,
                            "pqc_set_local_from_params: ✓ extracted PQC private keys from end of buffer "
                            "(legacy format: RSA/ECC + PQC, Dilithium=%zu bytes at offset %zu, "
                            "Kyber=%zu bytes at offset %zu, total buffer length=%zu, "
@@ -3710,6 +3841,7 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
     pc->logger = logger;
     pc->sigKeysInitialized = false;
     pc->kemKeysInitialized = false;
+    pc->refCount = 0; /* Initialize reference count to 0 */
     UA_ByteString_init(&pc->localCertThumbprint);
     policy->policyContext = pc;
 
@@ -3724,7 +3856,7 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
             policy->policyContext = NULL;
             return rc;
         }
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "Local certificate copied (len=%u bytes)",
                     (unsigned)policy->localCertificate.length);
 
@@ -3733,6 +3865,17 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
             UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                            "UA_SecurityPolicy_PQC: failed to extract local PQC public keys (%s)",
                            UA_StatusCode_name(rcExtract));
+        }
+
+        if(!pc->sigKeysInitialized || !pc->kemKeysInitialized) {
+            UA_LOG_ERROR(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                        "UA_SecurityPolicy_PQC: Certificate provided (%zu bytes) but PQC keys "
+                        "could not be extracted. Certificate may be corrupt, missing PQC extensions, "
+                        "or in invalid format. Security policy initialization aborted.",
+                        policy->localCertificate.length);
+            UA_free(pc);
+            policy->policyContext = NULL;
+            return UA_STATUSCODE_BADCERTIFICATEINVALID;
         }
 
         /* Generar thumbprint del certificado local */
@@ -3744,13 +3887,19 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
             UA_LOG_WARNING(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                            "UA_SecurityPolicy_PQC: failed to generate local thumbprint: %s",
                            UA_StatusCode_name(rc));
-            /* UA_Openssl_X509_GetCertificateThumbprint ya limpia el thumbprint si falla después
-             * de asignar el buffer, pero si falla en UA_ByteString_allocBuffer, el thumbprint
-             * podría quedar en un estado inconsistente. Asegurémonos de que esté limpio. */
-            UA_ByteString_clear(&pc->localCertThumbprint);
+            /* UA_Openssl_X509_GetCertificateThumbprint handles cleanup internally.
+             * Only clear if data is non-NULL (should not happen, but defensive check). */
+            if(pc->localCertThumbprint.data != NULL) {
+                /* This should never happen if UA_Openssl_X509_GetCertificateThumbprint is correct,
+                 * but defensive: if data is non-NULL, it means allocBuffer succeeded but something
+                 * else failed, and UA_Openssl_X509_GetCertificateThumbprint should have cleared it.
+                 * Double-check and clear only if needed. */
+                UA_ByteString_clear(&pc->localCertThumbprint);
+            }
+            /* Ensure clean state: data should be NULL and length 0 after init or clear */
             UA_ByteString_init(&pc->localCertThumbprint);
         } else {
-            UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+            UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                          "UA_SecurityPolicy_PQC: local thumbprint initialized (%u bytes)",
                          (unsigned)pc->localCertThumbprint.length);
         }
@@ -3759,7 +3908,7 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
                     "UA_SecurityPolicy_PQC: no localCertificate provided, generating fallback keys");
     }
 
-    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
             "UA_SecurityPolicy_PQC: policy->localCertificate.length=%u",
             (unsigned)policy->localCertificate.length);
 
@@ -3771,12 +3920,12 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
 
     /* Fallback to generate keys if necessary */
     if(!pc->sigKeysInitialized) {
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_SecurityPolicy_PQC: sigKeys not initialized, calling pqc_init_keys");
         pqc_init_keys(pc);
     }
     if(!pc->kemKeysInitialized) {
-        UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+        UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                     "UA_SecurityPolicy_PQC: kemKeys not initialized, calling pqc_init_kem_keys");
         pqc_init_kem_keys(pc);
         if(pc->kemKeysInitialized && sizeof(pc->kemPrivateKey) >= 16) {
@@ -3865,7 +4014,7 @@ UA_SecurityPolicy_PQC(UA_SecurityPolicy *policy,
     policy->clear = UA_PQCPolicy_clear;
 
     /* 10. Log de éxito */
-    UA_LOG_INFO(logger, UA_LOGCATEGORY_SECURITYPOLICY,
+    UA_LOG_DEBUG(logger, UA_LOGCATEGORY_SECURITYPOLICY,
                 "Post-Quantum SecurityPolicy (Dilithium2 + Kyber768) initialized successfully. PQCkeys=%s, KEMkeys=%s",
                 pc->sigKeysInitialized ? "yes" : "no",
                 pc->kemKeysInitialized ? "yes" : "no");

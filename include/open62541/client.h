@@ -619,6 +619,12 @@ struct UA_ClientConfig {
     UA_Boolean noNewSession; /* Don't automatically create a new Session when
                               * the intial one is lost. Instead abort the
                               * connection when the Session is lost. */
+    /* DEVELOPMENT/TESTING ONLY: Allow SecurityPolicy#None endpoints even if
+     * SecurityPolicy#None is not explicitly configured in securityPolicies.
+     * When enabled, the client will accept SecurityPolicy#None + SecurityMode NONE
+     * endpoints during endpoint selection. This should only be used for development
+     * and testing purposes, not in production. */
+    UA_Boolean allowSecurityPolicyNone;
 
     /* If either endpoint or userTokenPolicy has been set, then they are used
      * directly. Otherwise this information comes from the GetEndpoints response

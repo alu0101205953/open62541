@@ -288,6 +288,9 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
            const UA_UInt32 requestId, const UA_ByteString *msg) {
     UA_LOCK_ASSERT(&server->serviceMutex);
 
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: enter (state=%d, requestId=%u, msgLen=%zu)",
+                         channel->state, requestId, msg ? msg->length : 0);
 
     if(channel->state != UA_SECURECHANNELSTATE_ACK_SENT &&
        channel->state != UA_SECURECHANNELSTATE_OPEN) {
@@ -300,17 +303,35 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
     UA_NodeId requestType;
     UA_OpenSecureChannelRequest openSecureChannelRequest;
     size_t offset = 0;
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: decoding RequestType NodeId (offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     UA_StatusCode retval = UA_NodeId_decodeBinary(msg, &offset, &requestType);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: UA_NodeId_decodeBinary retval=%s offset=%zu remaining=%zu",
+                         UA_StatusCode_name(retval),
+                         offset, msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_NodeId_clear(&requestType);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the NodeId. "
-                               "Closing the SecureChannel.");
-        UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
+                               "Could not decode the NodeId (retval=%s, offset=%zu, remaining=%zu). "
+                               "Returning error to caller.",
+                               UA_StatusCode_name(retval), offset,
+                               msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
         return retval;
     }
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: NodeId decoded ok, next offset=%zu, remaining=%zu",
+                         offset, msg ? msg->length - offset : 0);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: decoding OpenSecureChannelRequest (offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     retval = UA_decodeBinaryInternal(msg, &offset, &openSecureChannelRequest,
                                      &UA_TYPES[UA_TYPES_OPENSECURECHANNELREQUEST], NULL);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: UA_decodeBinaryInternal(OpenSecureChannelRequest) retval=%s offset=%zu remaining=%zu",
+                         UA_StatusCode_name(retval),
+                         offset, msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
 
     /* Error occurred */
     const UA_NodeId *opnRequestId =
@@ -319,29 +340,64 @@ processOPN(UA_Server *server, UA_SecureChannel *channel,
         UA_NodeId_clear(&requestType);
         UA_OpenSecureChannelRequest_clear(&openSecureChannelRequest);
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
-                               "Could not decode the OPN message. "
-                               "Closing the SecureChannel.");
-        UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
+                               "Could not decode the OPN message (retval=%s, requestId match=%d, offset=%zu, remaining=%zu). "
+                               "Returning error to caller.",
+                               UA_StatusCode_name(retval),
+                               UA_NodeId_equal(&requestType, opnRequestId),
+                               offset,
+                               msg ? (msg->length > offset ? msg->length - offset : 0) : 0);
         return retval;
     }
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: OpenSecureChannelRequest decoded ok (final offset=%zu, remaining=%zu)",
+                         offset, msg ? msg->length - offset : 0);
     UA_NodeId_clear(&requestType);
 
     /* Call the service */
     UA_OpenSecureChannelResponse openScResponse;
     UA_OpenSecureChannelResponse_init(&openScResponse);
+    /* For the first OPN (channel not open yet), do not enforce any prior
+     * requestId expectation; use the received requestId as-is. */
     Service_OpenSecureChannel(server, channel, &openSecureChannelRequest, &openScResponse);
     UA_OpenSecureChannelRequest_clear(&openSecureChannelRequest);
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: Service_OpenSecureChannel result=%s",
+                         UA_StatusCode_name(openScResponse.responseHeader.serviceResult));
     if(openScResponse.responseHeader.serviceResult != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
                                "Could not open a SecureChannel. "
-                               "Closing the connection.");
+                               "Closing the connection. serviceResult=%s",
+                               UA_StatusCode_name(openScResponse.responseHeader.serviceResult));
         UA_SecureChannel_shutdown(channel, UA_SHUTDOWNREASON_REJECT);
         return openScResponse.responseHeader.serviceResult;
     }
 
     /* Send the response */
-    retval = UA_SecureChannel_sendAsymmetricOPNMessage(channel, requestId, &openScResponse,
-                                                       &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    /* For SecurityPolicy#None, OPN response MUST be sent unsecured per OPC UA Part 6.
+     * Detect SecurityPolicy#None BEFORE choosing the send path.
+     * DO NOT call UA_SecureChannel_sendAsymmetricOPNMessage for SecurityPolicy#None. */
+    UA_Boolean isNonePolicy = false;
+    if(channel->securityPolicy &&
+       channel->securityPolicy->policyUri.data != NULL &&
+       channel->securityPolicy->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&channel->securityPolicy->policyUri,
+                                        &UA_SECURITY_POLICY_NONE_URI);
+    }
+    
+    if(isNonePolicy) {
+        /* SecurityPolicy#None: Send unsecured OPN response (no asymmetric processing) */
+        UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                             "processOPN: Sending unsecured OPN response for SecurityPolicy#None (bypassing asymmetric path)");
+        retval = UA_SecureChannel_sendUnsecuredOPNMessage(channel, requestId, &openScResponse,
+                                                           &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    } else {
+        /* Other SecurityPolicies: Use asymmetric OPN path */
+        retval = UA_SecureChannel_sendAsymmetricOPNMessage(channel, requestId, &openScResponse,
+                                                           &UA_TYPES[UA_TYPES_OPENSECURECHANNELRESPONSE]);
+    }
+    UA_LOG_TRACE_CHANNEL(server->config.logging, channel,
+                         "processOPN: sending OpenSecureChannelResponse retval=%s (isNonePolicy=%d)",
+                         UA_StatusCode_name(retval), (int)isNonePolicy);
     UA_OpenSecureChannelResponse_clear(&openScResponse);
     if(retval != UA_STATUSCODE_GOOD) {
         UA_LOG_WARNING_CHANNEL(server->config.logging, channel,
@@ -738,6 +794,16 @@ createServerSecureChannel(UA_BinaryProtocolManager *bpm, UA_ConnectionManager *c
     UA_SecureChannel_init(channel);
     channel->config = connConfig;
     channel->certificateVerification = &config->secureChannelPKI;
+    
+    /* Log for tracing */
+    if(config->logging && channel->certificateVerification) {
+        UA_LOG_INFO(config->logging, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[FILESTORE-SERVER-CHANNEL] Channel %u: certificateVerification=%p, verifyCertificate=%p",
+                    channel->securityToken.channelId,
+                    (void*)channel->certificateVerification,
+                    (void*)channel->certificateVerification->verifyCertificate);
+    }
+    
     channel->processOPNHeader = configServerSecureChannel;
     channel->processOPNHeaderApplication = server;
     channel->connectionManager = cm;

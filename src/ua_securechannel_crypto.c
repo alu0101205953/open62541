@@ -158,8 +158,38 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     const UA_SecurityPolicy *sp = channel->securityPolicy;
     UA_CHECK_MEM(sp, return UA_STATUSCODE_BADINTERNALERROR);
 
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
-        *encryptedLength = 4 + securityHeaderLength + UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH + totalLength;
+    /* For SecurityPolicy#None, OPN MUST be sent completely unsecured per OPC UA Part 6.
+     * This function MUST NOT be called for SecurityPolicy#None - it's a logic bug.
+     * SecurityPolicy#None OPN must use UA_SecureChannel_sendUnsecuredOPNMessage instead. */
+    UA_Boolean isNonePolicy = false;
+    if(sp->policyUri.data != NULL && sp->policyUri.length > 0) {
+        isNonePolicy = UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI);
+    }
+    
+    if(isNonePolicy) {
+        UA_LOG_ERROR(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                     "[BADINTERNALERROR] prependHeadersAsym called with SecurityPolicy#None. "
+                     "This is a logic bug - SecurityPolicy#None OPN must use sendUnsecuredOPNMessage "
+                     "and bypass prependHeadersAsym entirely. channel.state=%d, requestId=%u",
+                     (int)channel->state, requestId);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    UA_LOG_DEBUG(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                "[TRACE-OPN] prependHeadersAsym: policyUri=%S securityMode=%d isNonePolicy=%d totalLen=%zu secHdrLen=%zu requestId=%u",
+                sp->policyUri, (int)channel->securityMode, (int)isNonePolicy, totalLength,
+                securityHeaderLength, requestId);
+
+    /* For SecurityPolicy#None, treat as unsecured OPN regardless of channel->securityMode */
+    if(isNonePolicy || channel->securityMode == UA_MESSAGESECURITYMODE_NONE) {
+        /* For SecurityPolicy#None there is no encryption/signature, but the
+         * message size must still include all headers (TCP + SecureChannel +
+         * SequenceHeader) plus the payload. Previously only the payload length
+         * was reported, leading to a truncated messageSize in the OPN chunk. */
+        *encryptedLength = totalLength +
+            UA_SECURECHANNEL_CHANNELHEADER_LENGTH +
+            securityHeaderLength +
+            UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
     } else {
         /* Check if this is PQC policy (doesn't use block-based encryption) */
         static const UA_String pqcPolicyUri = UA_STRING_STATIC("http://example.org/SecurityPolicy#PQC");
@@ -219,8 +249,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
     UA_AsymmetricAlgorithmSecurityHeader asymHeader;
     UA_AsymmetricAlgorithmSecurityHeader_init(&asymHeader);
     asymHeader.securityPolicyUri = sp->policyUri;
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
-       channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT) {
+    
+    /* For SecurityPolicy#None, MessageSecurityMode MUST be None per OPC UA spec.
+     * Do not include certificates in the header, regardless of channel->securityMode.
+     * This ensures the AsymmetricSecurityHeader matches the payload securityMode.
+     * isNonePolicy was already computed above, reuse it here. */
+    if(!isNonePolicy &&
+       (channel->securityMode == UA_MESSAGESECURITYMODE_SIGN ||
+        channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT)) {
         if(sp->localCertificate.length > 0 && sp->localCertificate.data) {
         asymHeader.senderCertificate = sp->localCertificate;
         } else {
@@ -257,6 +293,14 @@ prependHeadersAsym(UA_SecureChannel *const channel, UA_Byte *header_pos,
 void
 hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
               const UA_Byte **buf_end) {
+    /* Safety check: Return early if channel or securityPolicy is NULL.
+     * This restores the invariant: if securityMode != NONE, then securityPolicy != NULL.
+     * Treat NULL securityPolicy identically to UA_MESSAGESECURITYMODE_NONE.
+     * Do not modify buffers on early return to preserve message layout correctness. */
+    if(!channel || !channel->securityPolicy ||
+       channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
+        return;
+    
     /* Set buf_start to the beginning of the payload body */
     *buf_start += UA_SECURECHANNEL_CHANNELHEADER_LENGTH;
     size_t securityHeaderLength = calculateAsymAlgSecurityHeaderLength(channel);
@@ -284,9 +328,6 @@ hideBytesAsym(const UA_SecureChannel *channel, UA_Byte **buf_start,
     size_t securityHeaderLengthWithMargin = securityHeaderLength + margin;
     *buf_start += securityHeaderLengthWithMargin;
     *buf_start += UA_SECURECHANNEL_SEQUENCEHEADER_LENGTH;
-
-    if(channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
-        return;
 
     /* Make space for the certificate */
     *buf_end -= sp->asymmetricModule.cryptoModule.signatureAlgorithm.
@@ -425,8 +466,14 @@ signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
         UA_ByteString dataToSign = {signedLength, signBuffer};
         UA_ByteString signature = {sigsize, buf->data + preSignLength};
         
+        UA_LOG_DEBUG(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym(PQC): policyUri=%S securityMode=%d signedLen=%zu sigSize=%zu",
+                    sp->policyUri, (int)channel->securityMode, signedLength, sigsize);
+
         UA_StatusCode retval = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             sign(channel->channelContext, &dataToSign, &signature);
+        UA_LOG_DEBUG(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym(PQC): sign rc=%s", UA_StatusCode_name(retval));
         UA_free(signBuffer);
         UA_CHECK_STATUS(retval, return retval);
         
@@ -492,8 +539,15 @@ signAndEncryptAsym(UA_SecureChannel *channel, size_t preSignLength,
             getLocalSignatureSize(channel->channelContext);
         UA_ByteString dataToSign = {preSignLength, buf->data};
         UA_ByteString signature = {sigsize, buf->data + preSignLength};
+
+        UA_LOG_DEBUG(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym: policyUri=%S securityMode=%d signedLen=%zu sigSize=%zu",
+                    sp->policyUri, (int)channel->securityMode, preSignLength, sigsize);
+
         UA_StatusCode retval = sp->asymmetricModule.cryptoModule.signatureAlgorithm.
             sign(channel->channelContext, &dataToSign, &signature);
+        UA_LOG_DEBUG(sp->logger, UA_LOGCATEGORY_SECURITYPOLICY,
+                    "[TRACE-OPN] signAndEncryptAsym: sign rc=%s", UA_StatusCode_name(retval));
         UA_CHECK_STATUS(retval, return retval);
         
         /* Specification part 6, 6.7.4: The OpenSecureChannel Messages are
@@ -646,6 +700,14 @@ decryptAndVerifyChunk(const UA_SecureChannel *channel,
     /* Decrypt the chunk */
     UA_StatusCode res = UA_STATUSCODE_GOOD;
     const UA_Logger *logger = channel->securityPolicy ? channel->securityPolicy->logger : NULL;
+
+    /* For SecurityPolicy#None and MessageSecurityMode None, OPN carries no
+     * encryption/signature. Skip crypto entirely. */
+    if(messageType == UA_MESSAGETYPE_OPN &&
+       channel->securityPolicy &&
+       UA_String_equal(&channel->securityPolicy->policyUri, &UA_SECURITY_POLICY_NONE_URI) &&
+       channel->securityMode == UA_MESSAGESECURITYMODE_NONE)
+        return UA_STATUSCODE_GOOD;
     
     if(channel->securityMode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT ||
        messageType == UA_MESSAGETYPE_OPN) {
@@ -733,6 +795,9 @@ checkAsymHeader(UA_SecureChannel *channel,
     if(!sp) {
         return UA_STATUSCODE_BADINTERNALERROR;
     }
+    /* For SecurityPolicy#None, accept the header without thumbprint checks */
+    if(UA_String_equal(&sp->policyUri, &UA_SECURITY_POLICY_NONE_URI))
+        return UA_STATUSCODE_GOOD;
     if(!UA_String_equal(&sp->policyUri, &asymHeader->securityPolicyUri))
         return UA_STATUSCODE_BADSECURITYPOLICYREJECTED;
 
