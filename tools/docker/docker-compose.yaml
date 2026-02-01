@@ -1,0 +1,32 @@
+---
+
+services:
+  client:
+    container_name: client
+    image: pq-opcua:latest
+    environment:
+      MODE: client
+      HOST: server
+      PORT: 4840
+    volumes:
+      - ./certs:/certs
+    ports:
+      - "4840:4840"
+    networks:
+      - pq-opcua-network
+  
+  server:
+    container_name: server
+    image: pq-opcua:latest
+    environment:
+      MODE: server
+    volumes:
+      - ./certs:/certs
+    ports:
+      - "4840:4840"
+    networks:
+      - pq-opcua-network
+
+networks:
+  pq-opcua-network:
+    driver: bridge

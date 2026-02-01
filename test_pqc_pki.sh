@@ -49,7 +49,7 @@ echo ""
 echo "[3/7] Generando CSR del servidor..."
 "$BUILD_DIR/pqc_ca_tool" gen-csr \
     "C=DE,O=TestOrganization,CN=OPC-UA-Server" \
-    "URI:urn:open62541.server.application"
+    "URI:urn:open62541.unconfigured.application"
 if [ $? -ne 0 ]; then
     echo "ERROR: Fallo al generar CSR del servidor"
     exit 1
@@ -79,7 +79,7 @@ echo "[5/7] Generando CSR del cliente..."
 rm -f "$OUT_DIR"/*.csr "$OUT_DIR"/*_key.der "$OUT_DIR"/*_cert.der
 "$BUILD_DIR/pqc_ca_tool" gen-csr \
     "C=DE,O=TestOrganization,CN=OPC-UA-Client" \
-    "URI:urn:open62541.client.application"
+    "URI:urn:open62541.unconfigured.application"
 if [ $? -ne 0 ]; then
     echo "ERROR: Fallo al generar CSR del cliente"
     exit 1
