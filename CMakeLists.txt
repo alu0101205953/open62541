@@ -506,19 +506,21 @@ if(UA_ENABLE_ENCRYPTION_OPENSSL)
     # https://cmake.org/cmake/help/v3.13/module/FindOpenSSL.html
     find_package(OpenSSL REQUIRED)
     list(APPEND open62541_LIBRARIES "${OPENSSL_LIBRARIES}")
-    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
 
-    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+    find_library(OQS_LIBRARY NAMES oqs)
+
+    # Busca la cabecera en /usr/include, /usr/local/include, etc.
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h)
 
     if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
         message(STATUS "Found liboqs: ${OQS_LIBRARY}")
-        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
         include_directories(${OQS_INCLUDE_DIR})
         list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
         set(OQS_FOUND TRUE)
     else()
-        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+        message(FATAL_ERROR "Could not find liboqs. Please install it in standard system paths.")
     endif()
+
     if(WIN32)
         # Add bestcrypt for windows systems
         list(APPEND open62541_LIBRARIES bcrypt)
@@ -529,19 +531,21 @@ if(UA_ENABLE_ENCRYPTION_LIBRESSL)
     # See https://github.com/libressl-portable/portable/blob/master/FindLibreSSL.cmake
     find_package(LibreSSL REQUIRED)
     list(APPEND open62541_LIBRARIES ${LIBRESSL_LIBRARIES})
-    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
 
-    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+    find_library(OQS_LIBRARY NAMES oqs)
+
+    # Busca la cabecera en /usr/include, /usr/local/include, etc.
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h)
 
     if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
         message(STATUS "Found liboqs: ${OQS_LIBRARY}")
-        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
         include_directories(${OQS_INCLUDE_DIR})
         list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
         set(OQS_FOUND TRUE)
     else()
-        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+        message(FATAL_ERROR "Could not find liboqs. Please install it in standard system paths.")
     endif()
+
     if(WIN32)
         # Add bestcrypt for random generator and ws2_32 for crypto
         list(APPEND open62541_LIBRARIES ws2_32 bcrypt)
@@ -554,19 +558,20 @@ if(UA_ENABLE_ENCRYPTION_MBEDTLS)
     # defined in /tools/cmake/FindMbedTLS.cmake.
     find_package(MbedTLS REQUIRED)
     list(APPEND open62541_LIBRARIES ${MBEDTLS_LIBRARIES})
-    find_library(OQS_LIBRARY NAMES oqs PATHS /usr/local/lib NO_DEFAULT_PATH)
 
-    find_path(OQS_INCLUDE_DIR oqs/oqs.h PATHS /usr/local/include NO_DEFAULT_PATH)
+    find_library(OQS_LIBRARY NAMES oqs)
+
+    find_path(OQS_INCLUDE_DIR oqs/oqs.h)
 
     if (OQS_LIBRARY AND OQS_INCLUDE_DIR)
         message(STATUS "Found liboqs: ${OQS_LIBRARY}")
-        # Esta línea es la CLAVE para que puedas hacer #include <oqs/oqs.h>
         include_directories(${OQS_INCLUDE_DIR})
         list(APPEND open62541_LIBRARIES "${OQS_LIBRARY}")
         set(OQS_FOUND TRUE)
     else()
-        message(FATAL_ERROR "Could not find liboqs (library or headers). Please install it correctly or specify its path.")
+        message(FATAL_ERROR "Could not find liboqs. Please install it in standard system paths.")
     endif()
+
     if(WIN32)
         # Add bestcrypt for windows systems
         list(APPEND open62541_LIBRARIES bcrypt)
